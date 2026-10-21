@@ -54,6 +54,24 @@ pub enum ImportMode {
     Move,
 }
 
+/// Last confirmed import-review options, scoped to the library. Source files, individual
+/// selections and new-album names are deliberately transient.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LastImportSettings {
+    pub copy: bool,
+    pub move_files: bool,
+    pub album: Option<u64>,
+    pub preset: String,
+    pub keywords: String,
+    pub destination: String,
+    pub organize: String,
+    pub folder_template: String,
+    pub rename: String,
+    pub metadata_preset: String,
+    pub dng: bool,
+}
+
 /// What an import does with a file the library already has in Recently Deleted.
 ///
 /// Someone who imports such a file wants the photo in the library again, so the default brings
@@ -169,6 +187,9 @@ pub struct ImportCandidate {
     /// `"path"` (already in the library), `"content"` (same bytes in the library or earlier in this
     /// list): skipped by the import.
     pub duplicate: Option<String>,
+    /// The review read headers only; full content-duplicate checks run on confirmation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub duplicate_pending: bool,
     /// The photo that already has it.
     pub existing: Option<u64>,
     /// Not readable.
@@ -569,6 +590,7 @@ fn copy_into(dir: &Path, src: &str, name: Option<&str>, probe_hash: Option<&str>
 /// share can take minutes to read).
 pub struct ScanInput {
     probe: Option<crate::media::FileProbe>,
+    review: bool,
     skip: Option<PathBuf>,
     /// The library as it is now (photos are shared with the session, not copied): looked up for
     /// the files the scan finds ([`library_files`]) and the contents it probes
@@ -648,8 +670,17 @@ impl ScanInput {
         // (no table of the library here: this is the session's thread, and the library may hold
         // millions of photos. The scan looks up what it finds)
         let library = std::sync::Arc::new(s.catalog.clone());
-        let input = ScanInput { probe: s.media.file_probe.clone(), skip, library, cache: std::mem::take(&mut s.import_probes) };
+        let input = ScanInput { probe: s.media.file_probe.clone(), review: false, skip, library, cache: std::mem::take(&mut s.import_probes) };
         (input, paths.to_vec())
+    }
+
+    /// The interactive review can defer full-file hashing until selected files are imported.
+    /// Exact scans (CLI/MCP importPreview and folder synchronization) keep using `new`.
+    pub fn review(s: &mut Session, paths: &[String]) -> (Self, Vec<String>) {
+        let (mut input, paths) = Self::new(s, paths);
+        input.probe = s.media.file_header_probe.clone().or(input.probe);
+        input.review = true;
+        (input, paths)
     }
 
     /// The folder a scan never enters (the library's own).
@@ -724,6 +755,7 @@ pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &Sc
                 // as the import will date it (a sidecar's date, when there is one, still wins there)
                 c.captured = c.captured.or_else(|| info.file_modified.clone());
                 c.preview_only = info.preview_only.clone();
+                c.duplicate_pending = info.content_hash.is_none();
                 if let Some(h) = &info.content_hash {
                     match seen_hash.get(h) {
                         Some(existing) => {
@@ -735,7 +767,11 @@ pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &Sc
                         }
                     }
                 }
-                kept.insert(f, info);
+                // Partial header buffers have no full content hash. Never reuse them as
+                // completed probes during the final import: selected originals are checked there.
+                if !input.review || info.content_hash.is_some() {
+                    kept.insert(f, info);
+                }
             }
             Some(Err(e)) => c.error = Some(e),
             None => c.error = Some("not probed".into()),

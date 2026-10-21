@@ -134,7 +134,12 @@ fn ext_upper(name: &str) -> String {
 /// ([`lightcraft_codecs::read_header`], which refuses truncated files but can't see damage inside
 /// compressed data that is all there: such a file imports and shows as unreadable when rendered).
 pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
-    let content_hash = Some(lightcraft_preview::hash_bytes(bytes).to_string());
+    probe_bytes_with_hash(name, bytes, true)
+}
+
+/// Header-only buffers have gaps: their bytes must never be treated as a content hash.
+fn probe_bytes_with_hash(name: &str, bytes: &[u8], hash: bool) -> Result<ProbeInfo, String> {
+    let content_hash = hash.then(|| lightcraft_preview::hash_bytes(bytes).to_string());
     let m = lightcraft_meta::extract(bytes);
     let (meta, captured) = meta_of(&m);
     if lightcraft_raw::probe(bytes).is_some() {
@@ -769,6 +774,143 @@ fn fit_box(max_edge: usize) -> lightcraft_codecs::DecodeOptions {
     lightcraft_codecs::DecodeOptions::fit(e, e)
 }
 
+/// Probe a review candidate with bounded RAW-header reads. Unsupported plans, preview-only
+/// variants and small files use the exact whole-file probe. No partial hash reaches the catalog.
+pub fn fs_header_probe() -> FileProbe {
+    Arc::new(|path| {
+        let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let total = file.metadata().map_err(|e| format!("{path}: {e}"))?.len();
+        let weight = usize::try_from(total).unwrap_or(usize::MAX).saturating_mul(3);
+        let _permit = crate::memory::work_gate().acquire(weight);
+        let mut info = match read_header_probe(&mut file, path, total)? {
+            Some((info, _)) => info,
+            None => probe_bytes(path, &std::fs::read(path).map_err(|e| format!("{path}: {e}"))?)?,
+        };
+        info.file_modified = file_modified(path);
+        Ok(info)
+    })
+}
+
+/// Shared reader for the sparse probe and its byte-counting regression. The planner's
+/// monotone ranges and the same bounds as preview loading keep malformed files bounded.
+fn read_header_probe(file: &mut (impl std::io::Read + std::io::Seek), path: &str, total: u64) -> Result<Option<(ProbeInfo, u64)>, String> {
+    use lightcraft_raw::sparse::{HeaderPlan, Ranges};
+    use std::io::SeekFrom;
+
+    if !(4 * 1024 * 1024..=MAX_PREVIEW_PLAN_BYTES).contains(&total) {
+        return Ok(None);
+    }
+    let len = usize::try_from(total).map_err(|_| format!("{path}: file too large"))?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).map_err(|e| format!("{path}: cannot allocate header buffer: {e}"))?;
+    buf.resize(len, 0);
+    let mut loaded = Ranges::new();
+    let prefix = usize::try_from(PLAN_PREFIX.min(total)).map_err(|_| format!("{path}: header too large"))?;
+    let Some(head) = buf.get_mut(..prefix) else { return Ok(None) };
+    file.seek(SeekFrom::Start(0)).map_err(|e| format!("{path}: {e}"))?;
+    file.read_exact(head).map_err(|e| format!("{path}: {e}"))?;
+    loaded.insert(0, prefix as u64);
+    for _ in 0..MAX_PREVIEW_PLAN_ROUNDS {
+        match lightcraft_raw::sparse::header_plan(&buf, &loaded) {
+            HeaderPlan::Need(ranges) => {
+                if ranges.total() == 0
+                    || loaded.total().saturating_add(ranges.total()).saturating_mul(10) > total.saturating_mul(MAX_PREVIEW_PLAN_SHARE)
+                {
+                    return Ok(None);
+                }
+                for &(start, end) in ranges.spans() {
+                    let (Ok(a), Ok(b)) = (usize::try_from(start), usize::try_from(end)) else { return Ok(None) };
+                    let Some(dst) = buf.get_mut(a..b) else { return Ok(None) };
+                    file.seek(SeekFrom::Start(start)).map_err(|e| format!("{path}: {e}"))?;
+                    file.read_exact(dst).map_err(|e| format!("{path}: {e}"))?;
+                    loaded.insert(start, end);
+                }
+            }
+            HeaderPlan::Ready => {
+                let Ok(info) = probe_bytes_with_hash(path, &buf, false) else { return Ok(None) };
+                // A failed raw probe can describe only its embedded preview. Its payload may
+                // not be among header_plan's ranges, so retain the exact fallback for it.
+                return Ok(info.preview_only.is_none().then_some((info, loaded.total())));
+            }
+            HeaderPlan::Whole(_) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod import_review_tests {
+    use super::*;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    /// Count actual reads, rather than merely trusting the planner's accounting.
+    struct Counted {
+        bytes: Cursor<Vec<u8>>,
+        read: u64,
+    }
+    impl Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.bytes.read(buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+    impl Seek for Counted {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(pos)
+        }
+    }
+
+    /// A large procedural RAW must retain its metadata without reading its sensor payload.
+    #[test]
+    fn review_header_probe_reads_a_fraction_and_matches_the_full_probe() {
+        let bytes = crate::tests_xmp::synthetic_dng_of(
+            2048,
+            1536,
+            "RGGB",
+            vec![2048; 2048 * 1536],
+            Some("<x:xmpmeta>review</x:xmpmeta>"),
+            lightcraft_meta::Metadata { make: Some("Test".into()), model: Some("Card Camera".into()), ..Default::default() },
+        );
+        let raw = lightcraft_raw::decode(&bytes).unwrap();
+        let bytes = lightcraft_raw::write_dng(
+            &raw,
+            &lightcraft_raw::DngWriteOptions {
+                compression: lightcraft_raw::DngCompression::Uncompressed,
+                xmp: Some("<x:xmpmeta>review</x:xmpmeta>".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let full = probe_bytes("card.dng", &bytes).unwrap();
+        let total = bytes.len() as u64;
+        assert!(total >= 4 * 1024 * 1024);
+        let mut reader = Counted { bytes: Cursor::new(bytes), read: 0 };
+        let (header, read) = read_header_probe(&mut reader, "card.dng", total).unwrap().expect("sparse DNG probe");
+        assert_eq!(read, reader.read);
+        assert!(read * 5 < total, "read {read} of {total} bytes");
+        assert!(header.content_hash.is_none());
+        assert!(full.content_hash.is_some());
+        assert_eq!((header.width, header.height, header.file_size, header.kind), (full.width, full.height, full.file_size, full.kind));
+        assert_eq!(header.meta, full.meta);
+        assert_eq!(header.captured, full.captured);
+        assert_eq!(header.as_shot_wb, full.as_shot_wb);
+        assert_eq!(header.embedded_lens, full.embedded_lens);
+        assert_eq!(header.xmp, full.xmp);
+        eprintln!("review RAW probe: {read}/{total} bytes");
+    }
+
+    /// An unknown container cannot be accepted just because its sparse buffer has a file length.
+    #[test]
+    fn review_header_probe_falls_back_for_unknown_and_small_files() {
+        for len in [128, 5 * 1024 * 1024] {
+            let mut reader = Counted { bytes: Cursor::new(vec![0; len]), read: 0 };
+            assert!(read_header_probe(&mut reader, "unknown.raw", len as u64).unwrap().is_none());
+            assert!(reader.read <= PLAN_PREFIX);
+        }
+    }
+}
+
 /// Filesystem-backed embedded-preview hook (native).
 ///
 /// The quick path reads the file's header and its embedded preview and nothing else (see
@@ -1097,6 +1239,7 @@ impl crate::Session {
         let (l, p) = fs_hooks();
         self.media.file_loader = Some(l);
         self.media.file_probe = Some(p);
+        self.media.file_header_probe = Some(fs_header_probe());
         self.media.preview_loader = Some(fs_preview_loader());
         self.media.denoise.loader = Some(fs_pair_loader());
         #[cfg(target_os = "macos")]

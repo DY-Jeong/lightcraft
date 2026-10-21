@@ -114,6 +114,40 @@ impl ImportDialog {
         let checked = candidates.iter().map(|c| c.duplicate.is_none() && c.error.is_none()).collect();
         ImportDialog { candidates, checked, on_deleted: "restore".into(), ..Default::default() }
     }
+
+    /// Capture only reusable options; the next source gets fresh candidates and selections.
+    fn settings(&self) -> lightcraft_engine::import::LastImportSettings {
+        lightcraft_engine::import::LastImportSettings {
+            copy: self.copy,
+            move_files: self.move_files,
+            album: self.album,
+            preset: self.preset.clone(),
+            keywords: self.keywords.clone(),
+            destination: self.destination.clone(),
+            organize: self.organize.clone(),
+            folder_template: self.folder_template.clone(),
+            rename: self.rename.clone(),
+            metadata_preset: self.metadata_preset.clone(),
+            dng: self.dng,
+        }
+    }
+
+    /// Restore the last confirmed options, dropping references removed from this library.
+    fn restore_settings(&mut self, s: &lightcraft_engine::Session) {
+        let Some(last) = &s.last_import else { return };
+        self.copy = last.copy;
+        self.move_files = last.move_files;
+        self.album = last.album.filter(|id| s.catalog.album(lightcraft_catalog::AlbumId(*id)).is_some_and(|a| !a.folder && !a.is_smart()));
+        self.preset = if s.presets.iter().any(|p| p.id == last.preset) { last.preset.clone() } else { String::new() };
+        self.metadata_preset =
+            if s.metadata_presets.iter().any(|p| p.name == last.metadata_preset) { last.metadata_preset.clone() } else { String::new() };
+        self.keywords = last.keywords.clone();
+        self.destination = last.destination.clone();
+        self.organize = last.organize.clone();
+        self.folder_template = last.folder_template.clone();
+        self.rename = last.rename.clone();
+        self.dng = last.dng;
+    }
     /// Mark the candidates whose photo is in Recently Deleted. They are checked when the choice
     /// for them (`on_deleted`) imports them — by default it restores them, so a photo deleted by
     /// mistake comes back by importing its file again (issue #706).
@@ -239,6 +273,8 @@ pub struct ImportTask {
     pub total: usize,
     pub done: usize,
     params: Value,
+    /// Review options are saved only once the engine accepts and starts this import.
+    review_settings: Option<lightcraft_engine::import::LastImportSettings>,
     pub imported: usize,
     /// Brought back from Recently Deleted (`onDeleted: restore`).
     pub restored: usize,
@@ -472,7 +508,7 @@ pub fn open(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String
         return Err("a scan is already running".into());
     }
     let sources = paths.clone();
-    let (input, paths) = ScanInput::new(&mut app.session, &paths);
+    let (input, paths) = ScanInput::review(&mut app.session, &paths);
     let progress = std::sync::Arc::new(ScanProgress::default());
     let (tx, rx) = std::sync::mpsc::channel();
     let p = progress.clone();
@@ -607,6 +643,7 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
     app.renderer.forget_imports();
     let mut d = ImportDialog::new(out.candidates);
+    d.restore_settings(&app.session);
     let trashed = d
         .candidates
         .iter()
@@ -616,9 +653,14 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
         })
         .collect();
     d.set_trashed(trashed);
-    d.copy = task.copy;
+    // A device import keeps its explicit Copy default, even after a previous Add or Move.
+    if task.copy {
+        d.copy = true;
+        d.move_files = false;
+    }
     // only an album the review offers (it may have been deleted while the scan ran)
-    d.album = task.album.filter(|id| app.session.catalog.album(lightcraft_catalog::AlbumId(*id)).is_some_and(|a| !a.folder && !a.is_smart()));
+    d.album =
+        task.album.or(d.album).filter(|id| app.session.catalog.album(lightcraft_catalog::AlbumId(*id)).is_some_and(|a| !a.folder && !a.is_smart()));
     d.sources = task.sources;
     app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
 }
@@ -677,7 +719,11 @@ pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String>
         }
     }
     let total = queue.len();
-    app.import = Some(ImportTask::new(queue, params, undo0, false));
+    let mut task = ImportTask::new(queue, params, undo0, false);
+    let mut settings = d.settings();
+    settings.album = album;
+    task.review_settings = Some(settings);
+    app.import = Some(task);
     app.renderer.forget_imports();
     Ok(json!({"importing": total}))
 }
@@ -710,6 +756,13 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
         }
         match started {
             Ok(run) => {
+                if let Some(settings) = task.review_settings.take() {
+                    app.session.last_import = Some(settings);
+                    if let Err(e) = app.session.save_prefs() {
+                        log::warn!("saving import settings: {e}");
+                        app.toast(ctx, format!("{}: {e}", crate::i18n::tr("Could not save import settings")));
+                    }
+                }
                 let label = if task.browse { "Reading folder" } else { "Importing" };
                 task.guard = Some(app.session.activity.start("import", label, lightcraft_engine::activity::Cancel::Flag(run.cancel.clone())));
                 task.run = Some(run);
@@ -988,6 +1041,9 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
     let n = d.candidates.len();
     let (dups, in_source, trashed) = dup_counts(d);
     let sel = d.selected_paths().len();
+    if d.candidates.iter().any(|c| c.duplicate_pending) {
+        ui.label(egui::RichText::new(crate::i18n::tr("Content duplicates are checked when importing.")).color(t.text_dim).small());
+    }
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} found · {sel} selected", n = n, sel = sel)).color(t.text));
         if dups > 0 {
@@ -1580,6 +1636,53 @@ fn field<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Restore options without retaining per-source state or dangling library references.
+    #[test]
+    fn import_review_restores_options_but_rebuilds_the_selection() {
+        let mut previous = dialog();
+        previous.copy = true;
+        previous.move_files = true;
+        previous.album = Some(u64::MAX);
+        previous.preset = "deleted-preset".into();
+        previous.metadata_preset = "deleted-metadata".into();
+        previous.keywords = "travel, card".into();
+        previous.destination = "photos".into();
+        previous.organize = "custom".into();
+        previous.folder_template = "{date:%Y}".into();
+        previous.rename = "{name}-{seq:3}".into();
+        previous.dng = true;
+        previous.new_album = "do not create again".into();
+        previous.checked.fill(false);
+        let mut s = lightcraft_engine::Session::new();
+        s.last_import = Some(previous.settings());
+        let mut next = dialog();
+        next.restore_settings(&s);
+        assert!(next.copy && next.move_files && next.dng);
+        assert_eq!((next.keywords.as_str(), next.destination.as_str()), ("travel, card", "photos"));
+        assert_eq!((next.organize.as_str(), next.folder_template.as_str(), next.rename.as_str()), ("custom", "{date:%Y}", "{name}-{seq:3}"));
+        assert_eq!(next.album, None);
+        assert!(next.preset.is_empty() && next.metadata_preset.is_empty() && next.new_album.is_empty());
+        assert_eq!(next.checked, [true, true, true, false, true, true]);
+        assert_eq!(s.last_import.as_ref().unwrap().keywords, "travel, card", "opening or cancelling never rewrites preferences");
+    }
+
+    /// Engine validation happens after the review closes; failure must retain the last settings.
+    #[test]
+    fn import_review_invalid_import_keeps_last_confirmed_settings() {
+        let mut s = lightcraft_engine::Session::new();
+        let saved = lightcraft_engine::import::LastImportSettings { keywords: "previous".into(), ..Default::default() };
+        s.last_import = Some(saved.clone());
+        let mut app = LightcraftApp::new(s, crate::Services::default());
+        let mut d = dialog();
+        d.keywords = "new, not accepted".into();
+        d.preset = "does-not-exist".into();
+        start(&mut app, &d).unwrap();
+        assert_eq!(app.session.last_import.as_ref(), Some(&saved));
+        tick(&mut app, &egui::Context::default());
+        assert!(app.import.is_none());
+        assert_eq!(app.session.last_import.as_ref(), Some(&saved));
+    }
 
     #[test]
     fn grid_height_follows_the_window() {

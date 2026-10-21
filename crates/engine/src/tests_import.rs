@@ -6,6 +6,48 @@ use serde_json::{Value, json};
 
 use crate::Session;
 
+/// A fast review must not weaken final duplicate checks or verified Copy/Move transfers.
+#[test]
+fn review_partial_probes_are_rechecked_before_add_copy_and_move() {
+    use crate::import::{ImportMode, ScanInput, ScanProgress, scan_with};
+    let bytes = crate::tests_xmp::synthetic_dng_of(2048, 1536, "RGGB", vec![2048; 2048 * 1536], None, Default::default());
+    let raw = lightcraft_raw::decode(&bytes).unwrap();
+    let bytes = lightcraft_raw::write_dng(
+        &raw,
+        &lightcraft_raw::DngWriteOptions { compression: lightcraft_raw::DngCompression::Uncompressed, ..Default::default() },
+    )
+    .unwrap();
+    let hash = lightcraft_preview::hash_bytes(&bytes).to_string();
+    for (tag, mode) in [("add", ImportMode::Add), ("copy", ImportMode::Copy), ("move", ImportMode::Move)] {
+        let root = temp_dir(&format!("review-{tag}"));
+        let src = root.join("card");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.dng"), &bytes).unwrap();
+        std::fs::write(src.join("b.dng"), &bytes).unwrap();
+        let mut s = Session::new().with_fs();
+        s.open_library(root.join("library"), false).unwrap();
+        let paths = vec![src.to_string_lossy().to_string()];
+        let (input, paths) = ScanInput::review(&mut s, &paths);
+        let out = scan_with(input, &paths, &ScanProgress::default());
+        assert_eq!(out.candidates.len(), 2);
+        assert!(out.candidates.iter().all(|c| c.duplicate_pending && c.error.is_none()));
+        assert!(out.probes.is_empty(), "partial buffers must not be reused as exact probes");
+        s.import_probes = out.probes;
+        let report = crate::import::import(&mut s, &paths, mode).unwrap();
+        assert_eq!(report.imported.len(), 1, "{tag}: {report:?}");
+        assert_eq!(report.duplicates.len(), 1, "{tag}: {report:?}");
+        assert!(report.failed.is_empty(), "{tag}: {report:?}");
+        let photo = s.catalog.photos().next().unwrap();
+        assert_eq!(photo.content_hash.as_deref(), Some(hash.as_str()));
+        let lightcraft_catalog::Source::File { path } = &photo.source else { panic!("file photo") };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(src.join("a.dng").exists(), mode != ImportMode::Move);
+        assert!(src.join("b.dng").exists(), "a duplicate original is never removed");
+        drop(s);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("lc-import-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);

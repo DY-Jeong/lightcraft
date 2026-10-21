@@ -3174,6 +3174,8 @@ mod tests {
     #[test]
     fn a_connected_card_opens_the_import_review() {
         let mut h = demo([1200.0, 900.0]);
+        h.app.session.last_import =
+            Some(lightcraft_engine::import::LastImportSettings { copy: true, move_files: true, keywords: "remembered".into(), ..Default::default() });
         let t = Duration::from_secs(10);
         let root = std::env::temp_dir().join(format!("lc-card-{}", std::process::id()));
         let dcim = root.join("DCIM/100NIKON");
@@ -3203,6 +3205,8 @@ mod tests {
         assert!(h.step_until(t, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. }))));
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert!(opts.copy, "a card is copied into the library");
+        assert!(!opts.move_files, "the card's explicit Copy default takes precedence over the last Move");
+        assert_eq!(opts.keywords, "remembered");
         // with the option off nothing is remembered, so turning it on again starts with a first look
         assert!(!h.app.session.import_defaults.show_on_card);
         h.step();
@@ -3494,11 +3498,20 @@ mod tests {
         assert_eq!(h.app.session.catalog.len(), n0 + 4);
         let album = h.app.session.catalog.albums().find(|a| a.name == "Card 1").expect("album").id;
         assert_eq!(h.app.session.catalog.album_count(album), 4);
+        let last = h.app.session.last_import.as_ref().expect("confirmed import settings");
+        assert_eq!(last.keywords, "cardone, 2026");
+        assert_eq!(last.album, Some(album.0));
         assert!(h.app.session.catalog.photos().filter(|p| p.meta.keywords.contains(&"cardone".to_string())).count() == 4);
         assert_eq!(h.app.session.undo.len(), undo0 + 1, "one undo step");
         h.request("engine.execute", json!({"command": "edit.undo"}), t);
         assert_eq!(h.app.session.catalog.len(), n0);
         h.settle(SETTLE);
+        h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no reopened import review") };
+        assert_eq!(opts.keywords, "cardone, 2026");
+        assert!(opts.new_album.is_empty(), "the new album name is not replayed");
+        assert_eq!(opts.selected_paths().len(), 5, "the new source gets a fresh selection");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
