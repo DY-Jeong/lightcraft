@@ -306,6 +306,8 @@ pub struct Session {
     pub xmp: sidecar::XmpPrefs,
     /// Parameters of the last export (`app.export` params, minus targets), persisted in prefs.json.
     pub last_export: Option<serde_json::Value>,
+    /// Last confirmed import-review options, persisted per library.
+    pub last_import: Option<import::LastImportSettings>,
     /// The options of the last Photo Merge started, per command (`merge.hdr`, `merge.panorama`,
     /// `merge.hdrPanorama`): the merge dialog opens with them and "… with Last Settings" uses
     /// them. Persisted in prefs.json.
@@ -472,6 +474,7 @@ impl Session {
             library_identity: Arc::new(()),
             xmp: sidecar::XmpPrefs::default(),
             last_export: None,
+            last_import: None,
             last_merge: Default::default(),
             export_presets: Vec::new(),
             print: Default::default(),

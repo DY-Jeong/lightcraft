@@ -3301,6 +3301,46 @@ mod tests {
         assert!(h.quit_requested());
     }
 
+    /// Folder listing must not wait on a header probe (including a probe waiting on faces).
+    #[test]
+    fn import_review_lists_before_headers_and_keeps_manual_selection() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let mut h = demo([1200.0, 900.0]);
+        let dir = std::env::temp_dir().join(format!("lc-progressive-review-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("first.png"), b"test").unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        h.app.session.media.file_header_probe = Some(Arc::new(move |_| {
+            let (lock, cv) = &*worker_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            Ok(lightcraft_engine::media::ProbeInfo { width: 80, height: 60, format: "PNG".into(), ..Default::default() })
+        }));
+        h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), Duration::from_secs(10));
+        let listed = h.step_until(
+            Duration::from_secs(5),
+            |h| matches!(&h.app.ui.dialog, Some(crate::state::Dialog::Import { opts }) if opts.candidates.len() == 1),
+        );
+        let mut count = 0;
+        if let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog {
+            count = opts.candidates.len();
+            opts.checked.fill(false);
+        }
+        let scanning = h.app.scan.is_some();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(listed && scanning, "review opens while its probe is still blocked");
+        assert_eq!(count, 1);
+        assert!(h.step_until(Duration::from_secs(5), |h| h.app.scan.is_none()));
+        let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("review disappeared") };
+        assert_eq!(opts.candidates[0].width, 80);
+        assert_eq!(opts.checked, [false], "late metadata never rechecks a deselected photo");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// File → Import from Folder… opens the import review for a folder (searched recursively).
     #[test]
     fn add_folder_opens_the_import_review() {
@@ -3355,7 +3395,7 @@ mod tests {
         let r = h.request("engine.execute", json!({"command": "file.addFromDevice", "params": {"path": sub.to_string_lossy()}}), t);
         assert_eq!(r["ok"], true, "{r}");
         h.settle(SETTLE);
-        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert!(opts.copy);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3390,6 +3430,8 @@ mod tests {
     #[test]
     fn a_connected_card_opens_the_import_review() {
         let mut h = demo([1200.0, 900.0]);
+        h.app.session.last_import =
+            Some(lightcraft_engine::import::LastImportSettings { copy: true, move_files: true, keywords: "remembered".into(), ..Default::default() });
         let t = Duration::from_secs(10);
         let root = std::env::temp_dir().join(format!("lc-card-{}", std::process::id()));
         let dcim = root.join("DCIM/100NIKON");
@@ -3416,9 +3458,11 @@ mod tests {
         h.app.ui.dialog = None;
         crate::import::cards_seen(&mut h.app, vec![card.clone()]);
         assert!(h.app.scan.is_some(), "the card is scanned once the window is free");
-        assert!(h.step_until(t, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. }))));
+        assert!(h.step_until(t, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none()));
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert!(opts.copy, "a card is copied into the library");
+        assert!(!opts.move_files, "the card's explicit Copy default takes precedence over the last Move");
+        assert_eq!(opts.keywords, "remembered");
         // with the option off nothing is remembered, so turning it on again starts with a first look
         assert!(!h.app.session.import_defaults.show_on_card);
         h.step();
@@ -3540,7 +3584,7 @@ mod tests {
         assert!(h.app.scan.is_some() || h.app.ui.dialog.is_some());
         h.settle(SETTLE);
         assert!(h.app.scan.is_none());
-        assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3711,7 +3755,7 @@ mod tests {
         let r = h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
         assert_eq!(r["result"]["scanning"], true, "{r}");
         h.settle(SETTLE);
-        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
         h.step_until(SETTLE, |h| h.app.renderer.textures.keys().filter(|s| matches!(s, crate::render::Slot::Import(_))).count() >= 5);
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert_eq!(opts.candidates.len(), 6);
@@ -3734,11 +3778,20 @@ mod tests {
         assert_eq!(h.app.session.catalog.len(), n0 + 4);
         let album = h.app.session.catalog.albums().find(|a| a.name == "Card 1").expect("album").id;
         assert_eq!(h.app.session.catalog.album_count(album), 4);
+        let last = h.app.session.last_import.as_ref().expect("confirmed import settings");
+        assert_eq!(last.keywords, "cardone, 2026");
+        assert_eq!(last.album, Some(album.0));
         assert!(h.app.session.catalog.photos().filter(|p| p.meta.keywords.contains(&"cardone".to_string())).count() == 4);
         assert_eq!(h.app.session.undo.len(), undo0 + 1, "one undo step");
         h.request("engine.execute", json!({"command": "edit.undo"}), t);
         assert_eq!(h.app.session.catalog.len(), n0);
         h.settle(SETTLE);
+        h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
+        let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no reopened import review") };
+        assert_eq!(opts.keywords, "cardone, 2026");
+        assert!(opts.new_album.is_empty(), "the new album name is not replayed");
+        assert_eq!(opts.selected_paths().len(), 5, "the new source gets a fresh selection");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3769,7 +3822,7 @@ mod tests {
             h.request("engine.execute", json!({"command": "photo.rate", "params": {"ids": [id], "rating": 3}}), t);
             h.request("engine.execute", json!({"command": "photo.delete", "params": {"ids": [id]}}), t);
             h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
-            h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+            h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
             let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog else { panic!("no import review") };
             assert_eq!(opts.on_deleted, "restore", "the default brings a deleted photo back");
             assert_eq!(opts.selected_paths().len(), 2, "the trashed file is checked from the start: it will be restored");
@@ -3834,7 +3887,7 @@ mod tests {
         h.request("engine.execute", json!({"command": "photo.rate", "params": {"ids": [id], "rating": 3}}), t);
         h.request("engine.execute", json!({"command": "photo.delete", "params": {"ids": [id]}}), t);
         h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
-        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
         let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog else { panic!("no import review") };
         let trashed = (0..opts.candidates.len()).find(|i| opts.is_trashed(*i)).expect("a file in Recently Deleted");
         opts.set_on_deleted("");
@@ -3922,7 +3975,7 @@ mod tests {
         }
         let r2 = rect(&mut h);
         assert!((r2[2] - r1[2]).abs() < 0.5 && (r2[3] - r1[3]).abs() < 0.5, "the dialog kept its size: {r1:?} → {r2:?}");
-        assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })), "still open");
+        assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none(), "still open");
     }
 
     /// Adding a file again (dropped on the window, no review) whose photo is in Recently Deleted
@@ -4041,7 +4094,7 @@ mod tests {
         let before: Vec<lightcraft_catalog::PhotoId> = h.app.session.catalog.photos().map(|p| p.id).collect();
         let r = h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
         assert_eq!(r["result"]["scanning"], true, "{r}");
-        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
         let r = h.request("ui.dialog.confirm", json!({}), t);
         assert_eq!(r["ok"], true, "{r}");
         h.settle(SETTLE);
@@ -4076,7 +4129,7 @@ mod tests {
         let r = h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [src.to_string_lossy()]}}), t);
         assert_eq!(r["result"]["scanning"], true, "{r}");
         h.settle(SETTLE);
-        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })) && h.app.scan.is_none());
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert_eq!(opts.candidates.len(), 20);
         for id in ["button:importCopy", "button:importDest"] {

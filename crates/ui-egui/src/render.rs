@@ -544,7 +544,35 @@ impl Renderer {
         self.requests.insert(slot, Requested { id: job.request_id, source });
         let key = job.key;
         let display = self.display.clone();
-        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display)));
+        let import = matches!(slot, Slot::Import(_));
+        self.pool.submit(
+            slot,
+            key,
+            priority,
+            Box::new(move || {
+                Self::run_for(
+                    || {
+                        if import {
+                            let path = job.embedded.as_ref().map(|(p, _, _)| p.as_str()).or_else(|| {
+                                job.small.as_ref().and_then(|j| match &j.origin {
+                                    lightcraft_catalog::Source::File { path } => Some(path.as_str()),
+                                    _ => None,
+                                })
+                            });
+                            let weight = path
+                                .and_then(|p| std::fs::metadata(p).ok())
+                                .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX).saturating_mul(3))
+                                .unwrap_or(0);
+                            let _held = lightcraft_engine::memory::import_gate().acquire(weight);
+                            lightcraft_engine::memory::in_import(|| job.run())
+                        } else {
+                            job.run()
+                        }
+                    },
+                    &display,
+                )
+            }),
+        );
     }
 
     /// Render a slideshow title screen into `slot` (once per screen key, like [`Self::request`]):

@@ -374,6 +374,10 @@ pub struct MediaCache {
     /// What grid thumbnails load files with (see [`ReducedLoader`]); `None`: [`Self::file_loader`].
     pub reduced_loader: Option<ReducedLoader>,
     pub file_probe: Option<FileProbe>,
+    pub file_stager: Option<crate::files::FileStager>,
+    pub file_hasher: Option<crate::files::FileHasher>,
+    /// Lightweight import-review probe; final imports still use `file_probe`.
+    pub file_header_probe: Option<FileProbe>,
     pub preview_loader: Option<PreviewLoader>,
     /// Reads a photo file's bytes (Photo Merge); `None` = the local file system.
     pub file_bytes: Option<crate::merge::ByteReader>,
@@ -450,6 +454,9 @@ impl Default for MediaCache {
             file_loader: None,
             reduced_loader: None,
             file_probe: None,
+            file_stager: None,
+            file_hasher: None,
+            file_header_probe: None,
             preview_loader: None,
             file_bytes: None,
             smart_dir: None,
@@ -1729,6 +1736,9 @@ pub struct ProbeInfo {
     pub format: String,
     pub kind: MediaKind,
     pub file_size: u64,
+    pub source_modified: Option<std::time::SystemTime>,
+    /// Complete header metadata suitable for final import; a bounded review prefix is not.
+    pub header_complete: bool,
     pub captured: Option<String>,
     /// The file's modification time (ISO 8601, the clock of [`crate::import::system_clock`]): the
     /// capture date of a file whose metadata has none, as Lightroom does (exports saved without

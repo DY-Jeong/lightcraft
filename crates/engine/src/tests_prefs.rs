@@ -10,6 +10,50 @@ use serde_json::json;
 
 use crate::Session;
 
+/// The last review's options survive reopening, stay library-scoped, and default on legacy files.
+#[test]
+fn review_settings_persist_and_do_not_leak_between_libraries() {
+    let root = temp_dir("last-import");
+    let first = root.join("first");
+    let second = root.join("second");
+    let settings = crate::import::LastImportSettings {
+        copy: true,
+        move_files: true,
+        album: Some(9),
+        preset: "user.rawlook".into(),
+        keywords: "trip, family".into(),
+        destination: root.join("photos").to_string_lossy().to_string(),
+        organize: "custom".into(),
+        folder_template: "{date:%Y}/{date:%m}".into(),
+        rename: "{name}-{seq:3}".into(),
+        metadata_preset: "copyright".into(),
+        dng: true,
+    };
+    {
+        let mut s = Session::new();
+        s.open_library(&first, false).unwrap();
+        s.last_import = Some(settings.clone());
+        s.save_prefs().unwrap();
+    }
+    let mut s = Session::new();
+    s.open_library(&first, false).unwrap();
+    assert_eq!(s.last_import.as_ref(), Some(&settings));
+    s.open_library(&second, false).unwrap();
+    assert!(s.last_import.is_none(), "another library starts with its own defaults");
+    s.open_library(&first, false).unwrap();
+    assert_eq!(s.last_import.as_ref(), Some(&settings));
+    drop(s);
+    let prefs_path = first.join("prefs.json");
+    let mut prefs: serde_json::Value = serde_json::from_slice(&std::fs::read(&prefs_path).unwrap()).unwrap();
+    prefs.as_object_mut().unwrap().remove("lastImport");
+    std::fs::write(&prefs_path, serde_json::to_vec(&prefs).unwrap()).unwrap();
+    let mut s = Session::new();
+    s.open_library(&first, false).unwrap();
+    assert!(s.last_import.is_none(), "old preferences remain compatible");
+    drop(s);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("lc-prefs-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);

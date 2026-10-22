@@ -55,6 +55,24 @@ pub enum ImportMode {
     Move,
 }
 
+/// Last confirmed import-review options, scoped to the library. Source files, individual
+/// selections and new-album names are deliberately transient.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LastImportSettings {
+    pub copy: bool,
+    pub move_files: bool,
+    pub album: Option<u64>,
+    pub preset: String,
+    pub keywords: String,
+    pub destination: String,
+    pub organize: String,
+    pub folder_template: String,
+    pub rename: String,
+    pub metadata_preset: String,
+    pub dng: bool,
+}
+
 /// What an import does with a file the library already has in Recently Deleted.
 ///
 /// Someone who imports such a file wants the photo in the library again, so the default brings
@@ -170,6 +188,9 @@ pub struct ImportCandidate {
     /// `"path"` (already in the library), `"content"` (same bytes in the library or earlier in this
     /// list): skipped by the import.
     pub duplicate: Option<String>,
+    /// The review read headers only; full content-duplicate checks run on confirmation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub duplicate_pending: bool,
     /// The photo that already has it.
     pub existing: Option<u64>,
     /// Not readable.
@@ -370,6 +391,37 @@ pub fn apply_import_defaults(s: &Session, p: &mut Photo) {
     }
 }
 
+fn is_raw_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|e| {
+        matches!(
+            e.to_string_lossy().to_ascii_lowercase().as_str(),
+            "arw"
+                | "cr2"
+                | "cr3"
+                | "nef"
+                | "nrw"
+                | "dng"
+                | "raf"
+                | "orf"
+                | "rw2"
+                | "rwl"
+                | "raw"
+                | "pef"
+                | "srw"
+                | "iiq"
+                | "crw"
+                | "mrw"
+                | "x3f"
+                | "kdc"
+                | "mos"
+                | "erf"
+                | "3fr"
+                | "fff"
+                | "mef"
+        )
+    })
+}
+
 pub fn is_supported(path: &Path) -> bool {
     path.extension().is_some_and(|e| EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
@@ -501,6 +553,16 @@ pub(crate) fn probe_all(
     done: &std::sync::atomic::AtomicUsize,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Vec<Result<ProbeInfo, String>> {
+    probe_all_with_budget(probe, paths, done, cancel, false)
+}
+
+fn probe_all_with_budget(
+    probe: Option<&crate::media::FileProbe>,
+    paths: &[String],
+    done: &std::sync::atomic::AtomicUsize,
+    cancel: &std::sync::atomic::AtomicBool,
+    review: bool,
+) -> Vec<Result<ProbeInfo, String>> {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(probe) = probe.cloned() else {
         return paths
@@ -512,6 +574,17 @@ pub(crate) fn probe_all(
                 })
             })
             .collect();
+    };
+    let inspect = |path: &str| {
+        // Reserve outside the probe: custom filesystem hooks and nested decoders never
+        // wait on the face workers' gate, and this wait is cancellable.
+        let weight = if review {
+            1 << 20
+        } else {
+            std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX).saturating_mul(3)).unwrap_or(0)
+        };
+        let Some(_held) = crate::memory::import_gate().acquire_cancel(weight, cancel) else { return Err("cancelled".into()) };
+        crate::memory::in_import(|| probe(path))
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -531,7 +604,7 @@ pub(crate) fn probe_all(
                             if cancel.load(Relaxed) {
                                 break;
                             }
-                            let r = probe(&paths[i]);
+                            let r = inspect(&paths[i]);
                             done.fetch_add(1, Relaxed);
                             out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
                         }
@@ -547,7 +620,7 @@ pub(crate) fn probe_all(
             if cancel.load(Relaxed) {
                 return Err("cancelled".into());
             }
-            let r = probe(p);
+            let r = inspect(p);
             done.fetch_add(1, Relaxed);
             r
         })
@@ -570,6 +643,7 @@ fn copy_into(dir: &Path, src: &str, name: Option<&str>, probe_hash: Option<&str>
 /// share can take minutes to read).
 pub struct ScanInput {
     probe: Option<crate::media::FileProbe>,
+    review: bool,
     skip: Option<PathBuf>,
     /// The library as it is now (photos are shared with the session, not copied): looked up for
     /// the files the scan finds ([`library_files`]) and the contents it probes
@@ -649,8 +723,17 @@ impl ScanInput {
         // (no table of the library here: this is the session's thread, and the library may hold
         // millions of photos. The scan looks up what it finds)
         let library = std::sync::Arc::new(s.catalog.clone());
-        let input = ScanInput { probe: s.media.file_probe.clone(), skip, library, cache: std::mem::take(&mut s.import_probes) };
+        let input = ScanInput { probe: s.media.file_probe.clone(), review: false, skip, library, cache: std::mem::take(&mut s.import_probes) };
         (input, paths.to_vec())
+    }
+
+    /// The interactive review can defer full-file hashing until selected files are imported.
+    /// Exact scans (CLI/MCP importPreview and folder synchronization) keep using `new`.
+    pub fn review(s: &mut Session, paths: &[String]) -> (Self, Vec<String>) {
+        let (mut input, paths) = Self::new(s, paths);
+        input.probe = s.media.file_header_probe.clone().or(input.probe);
+        input.review = true;
+        (input, paths)
     }
 
     /// The folder a scan never enters (the library's own).
@@ -681,6 +764,65 @@ pub fn scan_with(input: ScanInput, paths: &[String], progress: &ScanProgress) ->
     scan_files(input, files, progress)
 }
 
+/// Incremental review results. Exact scans keep their existing complete-result API.
+pub enum ReviewEvent {
+    Listed(Vec<ImportCandidate>),
+    Inspected(Box<(ImportCandidate, Option<ProbeInfo>)>),
+    Complete(ScanOutput),
+}
+
+/// List first, then report headers as they finish. The emitter may discard intermediate
+/// inspection events under backpressure: Complete carries the authoritative final state.
+pub fn review_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress, emit: impl Fn(ReviewEvent) + Send + Sync + 'static) {
+    let files = expand(paths, input.skip.as_deref());
+    if progress.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let by_path = library_files(&input.library, &files);
+    let candidates = files
+        .iter()
+        .map(|path| {
+            by_path.get(Path::new(path)).map(|(_, c)| c.clone()).unwrap_or_else(|| ImportCandidate {
+                path: path.clone(),
+                name: Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_string(),
+                format: Path::new(path).extension().unwrap_or_default().to_string_lossy().to_uppercase(),
+                kind: if is_raw_extension(Path::new(path)) { MediaKind::Raw } else { MediaKind::Image },
+                duplicate_pending: true,
+                ..Default::default()
+            })
+        })
+        .collect();
+    let emit = std::sync::Arc::new(emit);
+    emit(ReviewEvent::Listed(candidates));
+    if let Some(probe) = input.probe.take() {
+        let updates = emit.clone();
+        input.probe = Some(std::sync::Arc::new(move |path| {
+            let result = probe(path);
+            let mut c = ImportCandidate {
+                path: path.into(),
+                name: Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            match &result {
+                Ok(info) => {
+                    c.format = info.format.clone();
+                    c.kind = info.kind;
+                    c.width = info.width;
+                    c.height = info.height;
+                    c.file_size = info.file_size;
+                    c.captured = info.captured.clone().or_else(|| info.file_modified.clone());
+                    c.preview_only = info.preview_only.clone();
+                    c.duplicate_pending = true;
+                }
+                Err(e) => c.error = Some(e.clone()),
+            }
+            updates(ReviewEvent::Inspected(Box::new((c, result.as_ref().ok().cloned()))));
+            result
+        }));
+    }
+    emit(ReviewEvent::Complete(scan_files(input, files, progress)));
+}
+
 /// [`scan_with`] for files that were found already (`paths` expanded, [`expand`]).
 pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &ScanProgress) -> ScanOutput {
     use std::sync::atomic::Ordering::Relaxed;
@@ -698,12 +840,12 @@ pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &Sc
                 return None;
             }
             let size = std::fs::metadata(f).map(|m| m.len()).ok();
-            (size.is_none() || size == Some(info.file_size)).then_some(info)
+            (size.is_none() || size == Some(info.file_size)).then_some(info).filter(|info| input.review || info.content_hash.is_some())
         })
         .collect();
     let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
     progress.done.store(todo.len() - missing.len(), Relaxed);
-    let mut fresh = probe_all(input.probe.as_ref(), &missing, &progress.done, &progress.cancel).into_iter();
+    let mut fresh = probe_all_with_budget(input.probe.as_ref(), &missing, &progress.done, &progress.cancel, input.review).into_iter();
     let probed: Vec<Result<ProbeInfo, String>> =
         cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
     crate::memory::release();
@@ -730,6 +872,7 @@ pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &Sc
                 // as the import will date it (a sidecar's date, when there is one, still wins there)
                 c.captured = c.captured.or_else(|| info.file_modified.clone());
                 c.preview_only = info.preview_only.clone();
+                c.duplicate_pending = info.content_hash.is_none();
                 if let Some(h) = &info.content_hash {
                     match seen_hash.get(h) {
                         Some(existing) => {
@@ -741,6 +884,8 @@ pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &Sc
                         }
                     }
                 }
+                // Keep review metadata, but only complete headers with an exact content hash
+                // may bypass final validation. Bounded prefixes are explicitly incomplete.
                 kept.insert(f, info);
             }
             Some(Err(e)) => c.error = Some(e),
@@ -791,6 +936,8 @@ pub struct ImportJob {
     by_hash: HashMap<String, Option<PhotoId>>,
     probe: Option<crate::media::FileProbe>,
     file_bytes: Option<crate::merge::ByteReader>,
+    stager: Option<crate::files::FileStager>,
+    hasher: Option<crate::files::FileHasher>,
     /// Probes from a preceding scan (not read again).
     cache: HashMap<String, ProbeInfo>,
     naming: crate::sidecar::SidecarNaming,
@@ -938,6 +1085,8 @@ impl ImportJob {
             by_hash: HashMap::new(),
             probe: s.media.file_probe.clone(),
             file_bytes: s.media.file_bytes.clone(),
+            stager: s.media.file_stager.clone(),
+            hasher: s.media.file_hasher.clone(),
             cache: std::mem::take(&mut s.import_probes),
             naming: s.xmp.naming,
             now: (s.clock)(),
@@ -1018,20 +1167,61 @@ impl ImportJob {
 
         // files a preceding scan already probed are not read again (a network share is slow to read),
         // as long as they are still there, as they were: a file gone or changed since is probed again
+        let mut header_cache = HashMap::new();
         let cached: Vec<Option<ProbeInfo>> = todo
             .iter()
             .map(|f| {
-                // (the web's files are not std::fs files: kept as probed)
-                self.cache
-                    .remove(f)
-                    .filter(|info| cfg!(target_arch = "wasm32") || std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.len() == info.file_size))
+                let info = self.cache.remove(f).filter(|info| {
+                    cfg!(target_arch = "wasm32")
+                        || std::fs::metadata(f).is_ok_and(|m| {
+                            m.is_file() && m.len() == info.file_size && info.source_modified.is_none_or(|t| m.modified().ok() == Some(t))
+                        })
+                })?;
+                if info.content_hash.is_some() {
+                    return Some(info);
+                }
+                header_cache.insert(f.clone(), info);
+                None
             })
             .collect();
         let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
         // Reading the files is the slow part of adding them where they are: it is counted on its
         // own, and `cancel` stops it too (a large library takes long enough to want both).
         self.read_total.fetch_add(missing.len(), Relaxed);
-        let mut fresh = probe_all(self.probe.as_ref(), &missing, &self.read_done, cancel).into_iter();
+        let mut stages = HashMap::new();
+        let mut results = Vec::new();
+        if mode == ImportMode::Copy
+            && let (Some(stager), Some(root)) = (&self.stager, &self.copy_root)
+        {
+            let inputs: Vec<_> = missing.iter().map(|path| (path.clone(), header_cache.remove(path))).collect();
+            for (path, result) in missing.iter().zip(crate::files::stage_files(stager, root, &inputs, cancel)) {
+                results.push(result.map(|(info, stage)| {
+                    stages.insert(path.clone(), stage);
+                    info
+                }));
+                self.read_done.fetch_add(1, Relaxed);
+            }
+        } else if !header_cache.is_empty()
+            && let Some(hasher) = &self.hasher
+        {
+            for path in &missing {
+                let result = match header_cache.remove(path) {
+                    Some(mut info) if info.header_complete => hasher(path, cancel).map(|hash| {
+                        info.content_hash = Some(hash);
+                        info
+                    }),
+                    _ => probe_all(self.probe.as_ref(), std::slice::from_ref(path), &std::sync::atomic::AtomicUsize::new(0), cancel)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| Err("not probed".into())),
+                };
+                self.read_done.fetch_add(1, Relaxed);
+                results.push(result);
+            }
+        } else {
+            results = probe_all(self.probe.as_ref(), &missing, &self.read_done, cancel);
+        }
+        let mut fresh = results.into_iter();
         let probed: Vec<Result<ProbeInfo, String>> =
             cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
         crate::memory::release();
@@ -1137,7 +1327,7 @@ impl ImportJob {
                     // Copy as DNG: the copied raw becomes a DNG (the copy is ours to replace)
                     let dng = opts.convert_dng && mode == ImportMode::Copy && raw && !info.format.eq_ignore_ascii_case("DNG");
                     plan.slots.push(Slot::Transfer);
-                    plan.transfers.push(Transfer { path, info, sidecar, dir, how, dng, family });
+                    plan.transfers.push(Transfer { staged: stages.remove(&path), path, info, sidecar, dir, how, dng, family });
                     continue;
                 }
                 (ImportMode::Move, _) => {
@@ -1194,6 +1384,7 @@ enum Slot {
 
 /// A file to copy or move into `dir`, planned in order and run on any thread ([`run_transfer`]).
 struct Transfer {
+    staged: Option<crate::files::StagedImport>,
     path: String,
     info: ProbeInfo,
     sidecar: Option<crate::sidecar::SidecarData>,
@@ -1266,7 +1457,7 @@ fn run_transfers(
         }
         let path = t.path.clone();
         // last-resort guard: a panic is this file's failure, not the import's
-        let item = crate::guard::catch("import", || run_transfer(t, file_bytes)).unwrap_or_else(|e| PreparedItem::Failed(path, e));
+        let item = crate::guard::catch("import", || run_transfer(t, file_bytes, cancel)).unwrap_or_else(|e| PreparedItem::Failed(path, e));
         done.fetch_add(1, Relaxed);
         Some(item)
     };
@@ -1312,8 +1503,8 @@ fn run_transfers(
 }
 
 /// Copy or move one planned file (and Copy as DNG); its item.
-fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>) -> PreparedItem {
-    let Transfer { path, mut info, sidecar, dir, how, dng, .. } = t;
+fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>, cancel: &std::sync::atomic::AtomicBool) -> PreparedItem {
+    let Transfer { path, mut info, sidecar, dir, how, dng, staged, .. } = t;
     let mut placed = None;
     let mut stored = match how {
         How::Place { name } => match crate::import_move::place(Path::new(&path), &dir, &name) {
@@ -1324,7 +1515,15 @@ fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>) -> P
             }
             Err(e) => return PreparedItem::Failed(path, e),
         },
-        How::Copy { name } => match copy_into(&dir, &path, name.as_deref(), info.content_hash.as_deref()) {
+        How::Copy { name } => match match staged.as_ref() {
+            Some(stage) => {
+                let own = Path::new(&path).file_name().unwrap_or_default().to_string_lossy();
+                crate::import_move::place(&stage.path, &dir, name.as_deref().unwrap_or(&own))
+                    .map(|p| p.dst.to_string_lossy().to_string())
+                    .map_err(|e| format!("{e} (the original is untouched)"))
+            }
+            None => copy_into(&dir, &path, name.as_deref(), info.content_hash.as_deref()),
+        } {
             Ok(p) => p,
             Err(e) => return PreparedItem::Failed(path, e),
         },
@@ -1332,7 +1531,9 @@ fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>) -> P
     if dng {
         // decoding the raw twice and encoding it takes several times the file's size in memory
         let weight = usize::try_from(info.file_size).unwrap_or(usize::MAX).saturating_mul(6);
-        let _permit = crate::memory::work_gate().acquire(weight);
+        let Some(_permit) = crate::memory::import_gate().acquire_cancel(weight, cancel) else {
+            return PreparedItem::Failed(path, "cancelled".into());
+        };
         match crate::cmd::convert::write_dng_with(file_bytes, &stored, String::new()) {
             Ok(dng) => {
                 let _ = std::fs::remove_file(&stored);

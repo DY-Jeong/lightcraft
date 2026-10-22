@@ -6,6 +6,48 @@ use serde_json::{Value, json};
 
 use crate::Session;
 
+/// A fast review must not weaken final duplicate checks or verified Copy/Move transfers.
+#[test]
+fn review_partial_probes_are_rechecked_before_add_copy_and_move() {
+    use crate::import::{ImportMode, ScanInput, ScanProgress, scan_with};
+    let bytes = crate::tests_xmp::synthetic_dng_of(2048, 1536, "RGGB", vec![2048; 2048 * 1536], None, Default::default());
+    let raw = lightcraft_raw::decode(&bytes).unwrap();
+    let bytes = lightcraft_raw::write_dng(
+        &raw,
+        &lightcraft_raw::DngWriteOptions { compression: lightcraft_raw::DngCompression::Uncompressed, ..Default::default() },
+    )
+    .unwrap();
+    let hash = lightcraft_preview::hash_bytes(&bytes).to_string();
+    for (tag, mode) in [("add", ImportMode::Add), ("copy", ImportMode::Copy), ("move", ImportMode::Move)] {
+        let root = temp_dir(&format!("review-{tag}"));
+        let src = root.join("card");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.dng"), &bytes).unwrap();
+        std::fs::write(src.join("b.dng"), &bytes).unwrap();
+        let mut s = Session::new().with_fs();
+        s.open_library(root.join("library"), false).unwrap();
+        let paths = vec![src.to_string_lossy().to_string()];
+        let (input, paths) = ScanInput::review(&mut s, &paths);
+        let out = scan_with(input, &paths, &ScanProgress::default());
+        assert_eq!(out.candidates.len(), 2);
+        assert!(out.candidates.iter().all(|c| c.duplicate_pending && c.error.is_none()));
+        assert!(out.probes.values().all(|p| p.content_hash.is_none()), "partial metadata is retained without claiming an exact hash");
+        s.import_probes = out.probes;
+        let report = crate::import::import(&mut s, &paths, mode).unwrap();
+        assert_eq!(report.imported.len(), 1, "{tag}: {report:?}");
+        assert_eq!(report.duplicates.len(), 1, "{tag}: {report:?}");
+        assert!(report.failed.is_empty(), "{tag}: {report:?}");
+        let photo = s.catalog.photos().next().unwrap();
+        assert_eq!(photo.content_hash.as_deref(), Some(hash.as_str()));
+        let lightcraft_catalog::Source::File { path } = &photo.source else { panic!("file photo") };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(src.join("a.dng").exists(), mode != ImportMode::Move);
+        assert!(src.join("b.dng").exists(), "a duplicate original is never removed");
+        drop(s);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("lc-import-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -2183,4 +2225,74 @@ fn a_file_arriving_beside_its_raws_stem_reads_its_own_sidecar() {
     assert_eq!(r["sidecars"], 0, "{r}");
     assert_eq!(read(&s, "IMG_3.TIF"), 0, "the catalogued raw owns IMG_3.xmp");
     let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Real native probes must make progress even while face decodes exceed the common gate.
+#[test]
+fn import_probe_progresses_while_face_memory_is_held() {
+    let dir = temp_dir("face-memory-isolation");
+    let path = dir.join("photo.png");
+    write_png(&path, 41);
+    let held = crate::memory::work_gate().acquire_urgent(usize::MAX / 4);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let input = path.to_string_lossy().to_string();
+    let worker = std::thread::spawn(move || {
+        let mut s = Session::new().with_fs();
+        let result = s.execute("library.import", &json!({"paths": [input]}));
+        tx.send(result.map(|v| v["imported"].as_array().map_or(0, Vec::len))).unwrap();
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    assert_eq!(result.unwrap().unwrap(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Copy as DNG is import work too, not a background face decode.
+#[test]
+fn import_dng_conversion_progresses_while_face_memory_is_held() {
+    let dir = temp_dir("face-memory-dng");
+    let path = dir.join("photo.ARW");
+    // The container is sniffed, so a procedural DNG under a camera extension exercises
+    // conversion without a private/proprietary camera fixture.
+    let bytes = crate::tests_xmp::synthetic_dng_of(64, 48, "RGGB", vec![2048; 64 * 48], None, Default::default());
+    std::fs::write(&path, bytes).unwrap();
+    let held = crate::memory::work_gate().acquire_urgent(usize::MAX / 4);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (input, destination) = (path.to_string_lossy().to_string(), dir.join("out").to_string_lossy().to_string());
+    let worker = std::thread::spawn(move || {
+        let mut s = Session::new().with_fs();
+        let result = s.execute("library.import", &json!({"paths": [input], "mode": "copy", "destination": destination, "dng": true}));
+        let formats: Vec<_> = s.catalog.photos().map(|p| p.format.clone()).collect();
+        tx.send((result, formats)).unwrap();
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    let (report, formats) = result.unwrap();
+    assert_eq!(report.unwrap()["imported"].as_array().unwrap().len(), 1);
+    assert_eq!(formats, ["DNG"]);
+    assert!(path.is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Import thumbnails use the reduced loader on current main; it must not reacquire
+/// the shared face gate after the import reservation has already been acquired.
+#[test]
+fn import_reduced_loader_progresses_while_face_memory_is_held() {
+    let dir = temp_dir("face-memory-reduced-loader");
+    let path = dir.join("photo.png");
+    write_png(&path, 43);
+    let held = crate::memory::work_gate().acquire_urgent(usize::MAX / 4);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _permit = crate::memory::import_gate().acquire(1 << 20);
+        let result = crate::memory::in_background(|| crate::memory::in_import(|| crate::files::fs_reduced_loader()(&path.to_string_lossy(), 256)));
+        tx.send(result.map(|_| ())).unwrap();
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    result.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
 }

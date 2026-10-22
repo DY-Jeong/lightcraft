@@ -328,10 +328,19 @@ fn parent_param(p: &Value) -> Option<u64> {
 /// just started opens with that album chosen (an album's context menu ▸ Import ▸ …). An error
 /// means another scan is running.
 fn import_into_album(app: &mut LightcraftApp, p: &Value, r: Result<Value, String>) -> Result<Value, String> {
-    if r.is_ok()
-        && let Some(t) = &mut app.scan
-    {
-        t.album = p.get("album").and_then(Value::as_u64);
+    if r.is_ok() {
+        let album = p
+            .get("album")
+            .and_then(Value::as_u64)
+            .filter(|id| app.session.catalog.album(lightcraft_catalog::AlbumId(*id)).is_some_and(|a| !a.folder && !a.is_smart()));
+        if let Some(task) = &mut app.scan {
+            task.album = album;
+        }
+        if p.get("album").is_some()
+            && let Some(crate::state::Dialog::Import { opts }) = &mut app.ui.dialog
+        {
+            opts.album = album;
+        }
     }
     r
 }
@@ -1828,6 +1837,10 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 && let Some(t) = &mut app.scan
             {
                 t.copy = true;
+                if let Some(crate::state::Dialog::Import { opts }) = &mut app.ui.dialog {
+                    opts.copy = true;
+                    opts.move_files = false;
+                }
             }
             import_into_album(app, p, r)
         }
