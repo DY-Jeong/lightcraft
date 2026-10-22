@@ -1,6 +1,6 @@
 # Gaps: where LightCraft falls short of Lightroom
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-22 · **Change:** minor (import review responsiveness and remembered options)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-23 · **Change:** minor (progressive import review and concurrent face/import working memory)
 
 Every known shortfall, one entry each, ranked by user impact (how many Lightroom users hit it, and
 how hard it blocks them), then by effort. **Agents pick work from the top** (the first entry nobody is
@@ -127,3 +127,7 @@ Beta-blocking gaps (B) total **~230–430 h**; with the stability and platform w
 | 2026-10-10 | minor | Gap 8: Sony ILCE-7RM6 in-file distortion added next to the ILCE-7RM4A's, its lateral CA parsed but off by default (docs/sony-ilce7rm6-lens-corrections.md); the gap stays open (no lens database), hours unchanged |
 | 2026-10-14 | minor | Gap 10 shrinks: 97 Canon CR2, Pentax and Ricoh models verified on one CC0 file each (334 models, ~50% on a verified body) |
 | 2026-10-14 | minor | Gap 10: 515 of 1,446 models verified (36%), ~84% of photographers on a verified body (integration batch 36) |
+
+## Import concurrency follow-up (2026-10-23)
+
+LR-IMP-ADD-DIALOG / LR-IMP-DUPES now open review before folder I/O, bound review prefix reads to 256 KiB and update candidates incrementally. Import probes and review thumbnails use separate working space from face decodes; face worker memory caps cannot be bypassed by a larger thread setting. Native Copy stages with one source stream plus destination verification. Full sensor metadata is intentionally deferred when it is outside the review prefix. Storage-adaptive queue tuning, a general random-access RAW parser, and crash-orphan staging cleanup remain follow-ups; no raw-format or feature-count gap is claimed closed.

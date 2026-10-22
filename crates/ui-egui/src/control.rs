@@ -402,6 +402,7 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
             None => err("no dialog open"),
         },
         "ui.dialog.cancel" => {
+            crate::import::cancel_review(app);
             app.ui.dialog = None;
             ok(Value::Null)
         }

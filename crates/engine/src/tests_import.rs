@@ -31,7 +31,7 @@ fn review_partial_probes_are_rechecked_before_add_copy_and_move() {
         let out = scan_with(input, &paths, &ScanProgress::default());
         assert_eq!(out.candidates.len(), 2);
         assert!(out.candidates.iter().all(|c| c.duplicate_pending && c.error.is_none()));
-        assert!(out.probes.is_empty(), "partial buffers must not be reused as exact probes");
+        assert!(out.probes.values().all(|p| p.content_hash.is_none()), "partial metadata is retained without claiming an exact hash");
         s.import_probes = out.probes;
         let report = crate::import::import(&mut s, &paths, mode).unwrap();
         assert_eq!(report.imported.len(), 1, "{tag}: {report:?}");
@@ -1833,4 +1833,53 @@ fn presets_apply_the_imported_profile_they_name() {
     s.execute("develop.profile", &json!({"id": "lc.vivid", "amount": 100})).unwrap();
     assert_eq!(apply(&mut s, "Portra Soft").profile.id, "lc.vivid");
     let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Real native probes must make progress even while face decodes exceed the common gate.
+#[test]
+fn import_probe_progresses_while_face_memory_is_held() {
+    let dir = temp_dir("face-memory-isolation");
+    let path = dir.join("photo.png");
+    write_png(&path, 41);
+    let held = crate::memory::work_gate().acquire_urgent(usize::MAX / 4);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let input = path.to_string_lossy().to_string();
+    let worker = std::thread::spawn(move || {
+        let mut s = Session::new().with_fs();
+        let result = s.execute("library.import", &json!({"paths": [input]}));
+        tx.send(result.map(|v| v["imported"].as_array().map_or(0, Vec::len))).unwrap();
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    assert_eq!(result.unwrap().unwrap(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Copy as DNG is import work too, not a background face decode.
+#[test]
+fn import_dng_conversion_progresses_while_face_memory_is_held() {
+    let dir = temp_dir("face-memory-dng");
+    let path = dir.join("photo.ARW");
+    // The container is sniffed, so a procedural DNG under a camera extension exercises
+    // conversion without a private/proprietary camera fixture.
+    let bytes = crate::tests_xmp::synthetic_dng_of(64, 48, "RGGB", vec![2048; 64 * 48], None, Default::default());
+    std::fs::write(&path, bytes).unwrap();
+    let held = crate::memory::work_gate().acquire_urgent(usize::MAX / 4);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (input, destination) = (path.to_string_lossy().to_string(), dir.join("out").to_string_lossy().to_string());
+    let worker = std::thread::spawn(move || {
+        let mut s = Session::new().with_fs();
+        let result = s.execute("library.import", &json!({"paths": [input], "mode": "copy", "destination": destination, "dng": true}));
+        let formats: Vec<_> = s.catalog.photos().map(|p| p.format.clone()).collect();
+        tx.send((result, formats)).unwrap();
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    let (report, formats) = result.unwrap();
+    assert_eq!(report.unwrap()["imported"].as_array().unwrap().len(), 1);
+    assert_eq!(formats, ["DNG"]);
+    assert!(path.is_file());
+    let _ = std::fs::remove_dir_all(dir);
 }

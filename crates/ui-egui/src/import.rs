@@ -9,9 +9,7 @@
 //! one undo step.
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
-use lightcraft_engine::import::{
-    ImportCandidate, ImportUprightMode, ImportWarning, ImportWarningCode, ScanInput, ScanOutput, ScanProgress, scan_with,
-};
+use lightcraft_engine::import::{ImportCandidate, ImportUprightMode, ImportWarning, ImportWarningCode, ScanInput, ScanProgress, scan_with};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -56,6 +54,7 @@ pub(crate) fn note_dialog_bottom(ui: &egui::Ui) {
 pub struct ImportDialog {
     /// The files / folders that were scanned (shown as the source).
     pub sources: Vec<String>,
+    pub enumerating: bool,
     pub candidates: Vec<ImportCandidate>,
     pub checked: Vec<bool>,
     /// Copy into the library (else add in place).
@@ -455,7 +454,8 @@ impl ImportRun {
 /// window must keep answering meanwhile).
 pub struct ScanTask {
     progress: std::sync::Arc<ScanProgress>,
-    rx: std::sync::mpsc::Receiver<ScanOutput>,
+    rx: std::sync::mpsc::Receiver<lightcraft_engine::import::ReviewEvent>,
+    showing: bool,
     /// Open the review with "copy into the library" checked (a camera / card).
     pub copy: bool,
     /// Open the review with this album chosen (an album's context menu ▸ Import…).
@@ -504,23 +504,46 @@ pub(crate) fn cards_seen(app: &mut LightcraftApp, now: Vec<lightcraft_engine::de
 
 /// Scan `paths` in the background, then open the review dialog (see [`poll_scan`]).
 pub fn open(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String> {
+    if app.scan.as_ref().is_some_and(|t| !t.browse && t.showing) && !matches!(app.ui.dialog, Some(crate::state::Dialog::Import { .. })) {
+        cancel_review(app);
+    }
     if app.scan.is_some() {
         return Err("a scan is already running".into());
     }
     let sources = paths.clone();
+    let mut d = ImportDialog::new(Vec::new());
+    d.restore_settings(&app.session);
+    d.sources = sources.clone();
+    d.enumerating = true;
+    app.renderer.forget_imports();
+    app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
     let (input, paths) = ScanInput::review(&mut app.session, &paths);
     let progress = std::sync::Arc::new(ScanProgress::default());
+    #[cfg(not(target_arch = "wasm32"))]
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
+    #[cfg(target_arch = "wasm32")]
     let (tx, rx) = std::sync::mpsc::channel();
     let p = progress.clone();
     let job = move || {
-        let _ = tx.send(scan_with(input, &paths, &p));
+        lightcraft_engine::import::review_with(input, &paths, &p, move |event| {
+            // Headers never block while holding a memory reservation. The final result
+            // recovers any update dropped while the UI is busy.
+            if matches!(event, lightcraft_engine::import::ReviewEvent::Inspected(..)) {
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = tx.try_send(event);
+                #[cfg(target_arch = "wasm32")]
+                let _ = tx.send(event);
+            } else {
+                let _ = tx.send(event);
+            }
+        });
     };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(job);
     #[cfg(target_arch = "wasm32")]
     job();
     let guard = scan_guard(app, &progress, false);
-    app.scan = Some(ScanTask { progress, rx, copy: false, album: None, browse: false, sources, guard });
+    app.scan = Some(ScanTask { progress, rx, showing: true, copy: false, album: None, browse: false, sources, guard });
     Ok(json!({"scanning": true}))
 }
 
@@ -578,45 +601,109 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
             v.sort();
             v
         };
-        let _ = tx.send(scan_with(input, &files, &p));
+        let _ = tx.send(lightcraft_engine::import::ReviewEvent::Complete(scan_with(input, &files, &p)));
     };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(job);
     #[cfg(target_arch = "wasm32")]
     job();
     let guard = scan_guard(app, &progress, true);
-    app.scan = Some(ScanTask { progress, rx, copy: false, album: None, browse: true, sources: Vec::new(), guard });
+    app.scan = Some(ScanTask { progress, rx, showing: false, copy: false, album: None, browse: true, sources: Vec::new(), guard });
     app.renderer.forget_imports();
     Ok(json!({"path": dir_s, "subfolders": subfolders, "scanning": true}))
 }
 
 /// Collect a finished scan and open the review (called every frame).
 pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
-    let Some(task) = app.scan.as_ref() else { return };
+    // Bound each frame's work even when thousands of inspection results are ready.
+    for _ in 0..32 {
+        if !poll_scan_once(app, ctx) {
+            break;
+        }
+    }
+}
+
+fn poll_scan_once(app: &mut LightcraftApp, ctx: &egui::Context) -> bool {
+    let Some(task) = app.scan.as_ref() else { return false };
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    if task.showing && !matches!(app.ui.dialog, Some(crate::state::Dialog::Import { .. })) {
+        cancel_review(app);
+        return false;
+    }
+    task.guard.progress(task.progress.done.load(Ordering::Relaxed) as u64, task.progress.total.load(Ordering::Relaxed) as u64);
+    if task.guard.is_cancelled() {
+        if !task.browse && matches!(app.ui.dialog, Some(crate::state::Dialog::Import { .. })) {
+            app.ui.dialog = None;
+        }
+        if let Some(task) = app.scan.take() {
+            task.progress.cancel.store(true, Ordering::Relaxed);
+        }
+        return false;
+    }
     let out = match task.rx.try_recv() {
-        Ok(o) => o,
+        Ok(lightcraft_engine::import::ReviewEvent::Complete(o)) => o,
+        Ok(lightcraft_engine::import::ReviewEvent::Listed(candidates)) => {
+            let mut d = match app.ui.dialog.take() {
+                Some(crate::state::Dialog::Import { opts }) => *opts,
+                _ => return false,
+            };
+            let listed = ImportDialog::new(candidates);
+            d.candidates = listed.candidates;
+            d.checked = listed.checked;
+            d.enumerating = false;
+            if task.copy {
+                d.copy = true;
+                d.move_files = false;
+            }
+            d.album = task.album.or(d.album);
+            d.sources = task.sources.clone();
+            let trashed = d
+                .candidates
+                .iter()
+                .map(|c| c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted)))
+                .collect();
+            d.set_trashed(trashed);
+            app.renderer.forget_imports();
+            app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
+            if let Some(task) = app.scan.as_mut() {
+                task.showing = true;
+            }
+            ctx.request_repaint();
+            return false;
+        }
+        Ok(lightcraft_engine::import::ReviewEvent::Inspected(update)) => {
+            let (c, info) = *update;
+            if let Some(info) = info {
+                app.session.import_probes.insert(c.path.clone(), info);
+            }
+            if let Some(crate::state::Dialog::Import { opts }) = &mut app.ui.dialog {
+                let trashed = c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted));
+                update_candidate(opts, c, trashed);
+            }
+            ctx.request_repaint();
+            return true;
+        }
         Err(std::sync::mpsc::TryRecvError::Empty) => {
             if task.guard.is_cancelled() {
                 // ✕: the worker stops at its next file; don't wait for it (a NAS read can take a while)
                 app.scan = None;
-                return;
+                return false;
             }
             let (total, done) = (task.progress.total.load(Ordering::Relaxed), task.progress.done.load(Ordering::Relaxed));
             task.guard.progress(done as u64, total as u64);
             // while the folders are listed the total isn't known: say what is happening instead
             task.guard.detail(if total == 0 { crate::i18n::tr("Looking for photos…") } else { "" });
-            return;
+            return false;
         }
         Err(_) => {
             app.scan = None;
             app.toast(ctx, crate::i18n::tr("Scan failed"));
-            return;
+            return false;
         }
     };
-    let Some(task) = app.scan.take() else { return };
+    let Some(task) = app.scan.take() else { return false };
     if task.progress.cancel.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
     app.session.import_probes = out.probes;
     if task.browse {
@@ -635,11 +722,20 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
             let _ = total;
             app.import = Some(ImportTask::new(queue, json!({"mode": "add", "local": true}), undo0, true));
         }
-        return;
+        return false;
     }
     if out.candidates.is_empty() {
         app.toast(ctx, crate::i18n::tr("No photos found"));
-        return;
+        return false;
+    }
+    if task.showing {
+        if let Some(crate::state::Dialog::Import { opts }) = &mut app.ui.dialog {
+            for c in out.candidates {
+                let trashed = c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted));
+                update_candidate(opts, c, trashed);
+            }
+        }
+        return false;
     }
     app.renderer.forget_imports();
     let mut d = ImportDialog::new(out.candidates);
@@ -663,6 +759,30 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
         task.album.or(d.album).filter(|id| app.session.catalog.album(lightcraft_catalog::AlbumId(*id)).is_some_and(|a| !a.folder && !a.is_smart()));
     d.sources = task.sources;
     app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
+    false
+}
+
+/// Discard the review worker before confirmation/cancellation, without waiting on disk I/O.
+pub fn cancel_review(app: &mut LightcraftApp) {
+    if app.scan.as_ref().is_some_and(|t| !t.browse)
+        && let Some(task) = app.scan.take()
+    {
+        task.progress.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn update_candidate(d: &mut ImportDialog, c: ImportCandidate, trashed: bool) {
+    let Some(i) = d.candidates.iter().position(|old| old.path == c.path) else { return };
+    if let Some(value) = d.trashed.get_mut(i) {
+        *value = trashed;
+    }
+    let selectable = c.error.is_none() && (c.duplicate.is_none() || d.is_trashed(i));
+    if !selectable && let Some(checked) = d.checked.get_mut(i) {
+        *checked = false;
+    }
+    if let Some(old) = d.candidates.get_mut(i) {
+        *old = c;
+    }
 }
 
 impl ScanTask {
@@ -675,6 +795,9 @@ impl ScanTask {
 /// Start importing the dialog's checked files (the dialog's OK / `ui.dialog.confirm`).
 pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String> {
     busy_synchronizing(app)?;
+    if d.enumerating {
+        return Err("the folder listing is still running".into());
+    }
     let queue = d.selected_paths();
     if queue.is_empty() {
         return Err("no photos selected".into());
@@ -719,6 +842,7 @@ pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String>
         }
     }
     let total = queue.len();
+    cancel_review(app);
     let mut task = ImportTask::new(queue, params, undo0, false);
     let mut settings = d.settings();
     settings.album = album;

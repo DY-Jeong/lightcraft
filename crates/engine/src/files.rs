@@ -153,6 +153,7 @@ fn probe_bytes_with_hash(name: &str, bytes: &[u8], hash: bool) -> Result<ProbeIn
                     height: h,
                     format: ext_upper(name),
                     kind: MediaKind::Raw,
+                    header_complete: true,
                     file_size: bytes.len() as u64,
                     captured,
                     meta,
@@ -179,7 +180,9 @@ fn probe_bytes_with_hash(name: &str, bytes: &[u8], hash: bool) -> Result<ProbeIn
             height: h,
             format: ext_upper(name),
             kind: MediaKind::Raw,
+            header_complete: true,
             file_size: bytes.len() as u64,
+            source_modified: None,
             captured,
             file_modified: None,
             meta,
@@ -211,7 +214,9 @@ fn probe_bytes_with_hash(name: &str, bytes: &[u8], hash: bool) -> Result<ProbeIn
         height: h,
         format,
         kind: MediaKind::Image,
+        header_complete: true,
         file_size: bytes.len() as u64,
+        source_modified: None,
         captured,
         file_modified: None,
         meta,
@@ -774,6 +779,76 @@ fn fit_box(max_edge: usize) -> lightcraft_codecs::DecodeOptions {
     lightcraft_codecs::DecodeOptions::fit(e, e)
 }
 
+/// A bounded prefix for interactive review. Unknown fields stay unknown until import;
+/// inspecting a card must never allocate a sensor-sized buffer or fall back to a full RAW read.
+pub fn fs_review_probe() -> FileProbe {
+    Arc::new(|path| {
+        use std::io::Read;
+        const PREFIX: u64 = 256 * 1024;
+        let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        let _held = (!crate::memory::is_import()).then(|| crate::memory::import_gate().acquire(PREFIX as usize));
+        let mut bytes = Vec::new();
+        file.by_ref().take(PREFIX).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        let mut info = if before.len() <= PREFIX {
+            // Tiny files are already entirely in memory: hashing them costs no extra I/O.
+            probe_bytes_with_hash(path, &bytes, true)?
+        } else {
+            let metadata = lightcraft_meta::extract(&bytes);
+            let (meta, captured) = meta_of(&metadata);
+            let (mut width, mut height) = (metadata.width.unwrap_or(0), metadata.height.unwrap_or(0));
+            if metadata.orientation.is_some_and(|o| o.swaps_axes()) {
+                std::mem::swap(&mut width, &mut height);
+            }
+            let ext = ext_upper(path);
+            let raw = lightcraft_raw::probe(&bytes).is_some()
+                || matches!(
+                    ext.as_str(),
+                    "ARW"
+                        | "CR2"
+                        | "CR3"
+                        | "NEF"
+                        | "NRW"
+                        | "DNG"
+                        | "RAF"
+                        | "ORF"
+                        | "RW2"
+                        | "RWL"
+                        | "RAW"
+                        | "PEF"
+                        | "SRW"
+                        | "IIQ"
+                        | "CRW"
+                        | "MRW"
+                        | "X3F"
+                        | "KDC"
+                        | "MOS"
+                        | "ERF"
+                        | "3FR"
+                        | "FFF"
+                        | "MEF"
+                );
+            ProbeInfo {
+                width,
+                height,
+                format: if ext == "JPG" { "JPEG".into() } else { ext },
+                kind: if raw { MediaKind::Raw } else { MediaKind::Image },
+                meta,
+                captured,
+                ..Default::default()
+            }
+        };
+        let after = file.metadata().map_err(|e| e.to_string())?;
+        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+            return Err(format!("{path}: source changed while reading its header"));
+        }
+        info.file_size = before.len();
+        info.source_modified = before.modified().ok();
+        info.file_modified = file_modified(path);
+        Ok(info)
+    })
+}
+
 /// Probe a review candidate with bounded RAW-header reads. Unsupported plans, preview-only
 /// variants and small files use the exact whole-file probe. No partial hash reaches the catalog.
 pub fn fs_header_probe() -> FileProbe {
@@ -781,12 +856,13 @@ pub fn fs_header_probe() -> FileProbe {
         let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let total = file.metadata().map_err(|e| format!("{path}: {e}"))?.len();
         let weight = usize::try_from(total).unwrap_or(usize::MAX).saturating_mul(3);
-        let _permit = crate::memory::work_gate().acquire(weight);
+        let _permit = (!crate::memory::is_import()).then(|| crate::memory::import_gate().acquire(weight));
         let mut info = match read_header_probe(&mut file, path, total)? {
             Some((info, _)) => info,
-            None => probe_bytes(path, &std::fs::read(path).map_err(|e| format!("{path}: {e}"))?)?,
+            None => probe_bytes_with_hash(path, &std::fs::read(path).map_err(|e| format!("{path}: {e}"))?, false)?,
         };
         info.file_modified = file_modified(path);
+        info.source_modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
         Ok(info)
     })
 }
@@ -900,6 +976,22 @@ mod import_review_tests {
         eprintln!("review RAW probe: {read}/{total} bytes");
     }
 
+    #[test]
+    fn bounded_review_does_not_claim_complete_headers_for_large_files() {
+        let root = std::env::temp_dir().join(format!("lc-review-bounded-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.arw");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(128 << 20).unwrap();
+        drop(file);
+        let info = fs_review_probe()(&path.to_string_lossy()).unwrap();
+        assert_eq!(info.file_size, 128 << 20);
+        assert!(!info.header_complete && info.content_hash.is_none());
+        assert_eq!(info.kind, MediaKind::Raw);
+        assert!(info.source_modified.is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// An unknown container cannot be accepted just because its sparse buffer has a file length.
     #[test]
     fn review_header_probe_falls_back_for_unknown_and_small_files() {
@@ -922,7 +1014,8 @@ pub fn fs_preview_loader() -> PreviewLoader {
     Arc::new(|path: &str, max_edge: usize| {
         let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
         let gate = crate::memory::work_gate();
-        let _permit = if crate::memory::is_background() { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
+        let _permit = (!crate::memory::is_import())
+            .then(|| if crate::memory::is_background() { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) });
         if let Some(image) = preview_window(path, max_edge)
             .ok()
             .flatten()
@@ -1186,7 +1279,8 @@ pub fn fs_pair_loader() -> PairLoader {
         let len = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
         let weight = len * if max_edge <= crate::media::SourceLevel::Thumb.max_edge() { 4 } else { 10 };
         let gate = crate::memory::work_gate();
-        let _permit = if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) };
+        let _permit =
+            (!crate::memory::is_import()).then(|| if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) });
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         let r = load_vec_pair(bytes, max_edge, spec);
         crate::memory::release();
@@ -1206,7 +1300,8 @@ pub fn fs_hooks() -> (FileLoader, FileProbe) {
         let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
         let weight = len * if max_edge <= crate::media::SourceLevel::Thumb.max_edge() { 3 } else { 6 };
         let gate = crate::memory::work_gate();
-        let _permit = if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) };
+        let _permit =
+            (!crate::memory::is_import()).then(|| if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) });
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         let r = load_vec(bytes, max_edge);
         // the file, the samples and the intermediate images are gone: give their pages back
@@ -1215,13 +1310,188 @@ pub fn fs_hooks() -> (FileLoader, FileProbe) {
     });
     let probe: FileProbe = Arc::new(|path: &str| {
         let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
-        let _permit = crate::memory::work_gate().acquire(len);
+        let _permit = (!crate::memory::is_import()).then(|| crate::memory::import_gate().acquire(len));
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         let mut info = probe_bytes(path, &bytes)?;
         info.file_modified = file_modified(path);
+        info.source_modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
         Ok(info)
     });
     (loader, probe)
+}
+
+/// A private verified copy awaiting final naming. Failed/duplicate/cancelled work removes it.
+#[derive(Debug)]
+pub struct StagedImport {
+    pub(crate) path: std::path::PathBuf,
+}
+impl Drop for StagedImport {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub type FileStager =
+    Arc<dyn Fn(&str, &std::path::Path, Option<ProbeInfo>, &std::sync::atomic::AtomicBool) -> Result<(ProbeInfo, StagedImport), String> + Send + Sync>;
+pub type FileHasher = Arc<dyn Fn(&str, &std::sync::atomic::AtomicBool) -> Result<String, String> + Send + Sync>;
+
+pub(crate) fn hash_import_file(path: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let before = file.metadata().map_err(|e| e.to_string())?;
+    let mut hash = lightcraft_preview::Hasher128::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut read = 0u64;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        let Some(chunk) = buf.get(..n) else { return Err("invalid read length".into()) };
+        hash.update(chunk);
+        read = read.saturating_add(n as u64);
+    }
+    let after = file.metadata().map_err(|e| e.to_string())?;
+    if read != before.len() || before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err(format!("{path}: source changed while reading"));
+    }
+    Ok(hash.finish().to_string())
+}
+
+/// Bounded parallel transfers: source reads share import reservations, not face decode slots.
+pub(crate) fn stage_files(
+    stager: &FileStager,
+    root: &std::path::Path,
+    files: &[(String, Option<ProbeInfo>)],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<Result<(ProbeInfo, StagedImport), String>> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let run = |i: usize| {
+        let Some((path, cached)) = files.get(i) else { return Err("missing source".into()) };
+        let weight = if cached.as_ref().is_some_and(|i| i.header_complete) {
+            2 << 20
+        } else {
+            std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX).saturating_add(1 << 20)).unwrap_or(1 << 20)
+        };
+        let Some(_held) = crate::memory::import_gate().acquire_cancel(weight, cancel) else { return Err("cancelled".into()) };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stager(path, root, cached.clone(), cancel)))
+            .unwrap_or_else(|_| Err("copy worker failed".into()))
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let next = AtomicUsize::new(0);
+        let results = std::sync::Mutex::new((0..files.len()).map(|_| None).collect::<Vec<_>>());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..crate::import::workers(files.len()).min(2) {
+                let (run, next, results) = (&run, &next, &results);
+                #[cfg(test)]
+                let fault = crate::import_move::injected_fault();
+                if let Ok(handle) = std::thread::Builder::new().name("lightcraft-import-copy".into()).spawn_scoped(scope, move || {
+                    #[cfg(test)]
+                    crate::import_move::inject(fault);
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        if i >= files.len() {
+                            break;
+                        }
+                        let result = run(i);
+                        if let Some(slot) = results.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i) {
+                            *slot = Some(result);
+                        }
+                    }
+                }) {
+                    handles.push(handle);
+                }
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    log::warn!("import copy worker stopped unexpectedly");
+                }
+            }
+        });
+        results.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| run(i))).collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        (0..files.len()).map(run).collect()
+    }
+}
+
+/// Read the source once: copy and hash in the same loop, then probe/hash the destination
+/// to verify its bytes. The source is never reread to verify the copy.
+fn fs_stager() -> FileStager {
+    Arc::new(|path, root, cached, cancel| {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering::Relaxed;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
+        let mut src = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let before = src.metadata().map_err(|e| e.to_string())?;
+        let (stage, mut dst) = loop {
+            if cancel.load(Relaxed) {
+                return Err("cancelled".into());
+            }
+            let name = format!(".lightcraft-import-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Relaxed));
+            let file = root.join(name);
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
+                Ok(dst) => break (StagedImport { path: file }, dst),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        let mut hash = lightcraft_preview::Hasher128::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut copied = 0u64;
+        loop {
+            if cancel.load(Relaxed) {
+                return Err("cancelled".into());
+            }
+            let n = src.read(&mut buf).map_err(|e| format!("{path}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            let Some(chunk) = buf.get(..n) else { return Err("invalid read length".into()) };
+            hash.update(chunk);
+            dst.write_all(chunk).map_err(|e| e.to_string())?;
+            copied = copied.saturating_add(n as u64);
+        }
+        let after = src.metadata().map_err(|e| e.to_string())?;
+        if copied != before.len() || before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+            return Err(format!("{path}: source changed while copying"));
+        }
+        dst.sync_all().map_err(|e| e.to_string())?;
+        if let Ok(t) = before.modified() {
+            let _ = dst.set_modified(t);
+        }
+        drop(dst);
+        let expected = hash.finish().to_string();
+        let mut info =
+            match cached.filter(|info| info.header_complete && info.file_size == before.len() && info.source_modified == before.modified().ok()) {
+                Some(mut info) => {
+                    let verified = hash_import_file(&stage.path.to_string_lossy(), cancel)?;
+                    if verified != expected {
+                        return Err(format!("{path}: the copy differs from the original"));
+                    }
+                    info.content_hash = Some(verified);
+                    info
+                }
+                None => {
+                    let bytes = std::fs::read(&stage.path).map_err(|e| e.to_string())?;
+                    let info = probe_bytes(path, &bytes)?;
+                    if info.content_hash.as_deref() != Some(expected.as_str()) {
+                        return Err(format!("{path}: the copy differs from the original"));
+                    }
+                    info
+                }
+            };
+        info.file_modified = file_modified(path);
+        info.source_modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        Ok((info, stage))
+    })
 }
 
 /// `path`'s modification time as ISO 8601 (see [`ProbeInfo::file_modified`]); `None` when the
@@ -1239,7 +1509,9 @@ impl crate::Session {
         let (l, p) = fs_hooks();
         self.media.file_loader = Some(l);
         self.media.file_probe = Some(p);
-        self.media.file_header_probe = Some(fs_header_probe());
+        self.media.file_stager = Some(fs_stager());
+        self.media.file_hasher = Some(Arc::new(hash_import_file));
+        self.media.file_header_probe = Some(fs_review_probe());
         self.media.preview_loader = Some(fs_preview_loader());
         self.media.denoise.loader = Some(fs_pair_loader());
         #[cfg(target_os = "macos")]

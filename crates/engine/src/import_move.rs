@@ -275,7 +275,7 @@ pub(crate) fn sibling_photo(sidecar: &Path) -> Option<String> {
 /// (`AlreadyExists` when `dst` is taken).
 fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
     let force_copy = injected(Fault::NoLink) || injected(Fault::FailWrite) || injected(Fault::Corrupt);
-    if !force_copy && !is_symlink(src) {
+    if !force_copy && !injected(Fault::Slow) && !is_symlink(src) {
         match fs::hard_link(src, dst) {
             Ok(()) => {
                 let (a, b) = (fs::metadata(src)?, fs::metadata(dst)?);

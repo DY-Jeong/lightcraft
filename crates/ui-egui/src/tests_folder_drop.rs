@@ -47,7 +47,20 @@ fn app(paths: &[(PathBuf, bool)]) -> Headless {
 }
 
 fn widget(h: &Headless, id: &str) -> Option<Rect> {
-    h.app.widgets.iter().find(|(w, _)| w == id).map(|(_, r)| *r)
+    h.app
+        .widgets
+        .iter()
+        .find(|(w, _)| {
+            if w == id {
+                return true;
+            }
+            // Folder rows use forward slashes; Windows fixture paths may use backslashes.
+            ["source:libfolder:", "libraryFolderToggle:"].iter().any(|prefix| match (id.strip_prefix(prefix), w.strip_prefix(prefix)) {
+                (Some(a), Some(b)) => lightcraft_catalog::query::folder_key(a) == lightcraft_catalog::query::folder_key(b),
+                _ => false,
+            })
+        })
+        .map(|(_, r)| *r)
 }
 
 fn folder_row(h: &Headless, dir: &Path) -> Option<Rect> {
