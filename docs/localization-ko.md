@@ -26,6 +26,28 @@
 처음 검토한 다른 PR의 family 이름 불일치를 피하고, 파일 내부 이름과 일치하는
 `NanumGothic` manifest를 사용합니다. 두 후보의 Regular/Bold 폰트 바이트는 같습니다.
 
+### Windows에서 더블클릭으로 빌드
+
+저장소 루트의 [`build-windows.cmd`](../build-windows.cmd)를 더블클릭합니다.
+실행 위치와 관계없이 저장소로 이동하고, 나눔고딕이 포함된 craft-fonts를 준비한 뒤
+앱과 CLI를 HEIF 지원이 포함된 **Windows x64 릴리스**로 빌드합니다.
+첫 실행에는 인터넷 연결과 충분한 디스크 공간이 필요하며 오래 걸릴 수 있습니다.
+완료 또는 오류 메시지는 창에 남습니다. 자동 실행에서는 `build-windows.cmd --no-pause`를
+사용하면 종료 코드로 성공·실패를 확인할 수 있습니다.
+
+필수 도구는 **Git for Windows**, **Rust MSVC 툴체인**,
+**Visual Studio의 C++ 데스크톱 개발 도구와 Windows SDK**입니다.
+스크립트는 도구를 자동 설치하거나 관리자 권한을 요청하지 않으며, 없으면 설치 안내를
+표시합니다. MSVC 환경은 자동으로 설정하므로 개발자 터미널을 따로 열 필요가 없습니다.
+
+완료 후 `target\x86_64-pc-windows-msvc\release\lightcraft.exe`를 더블클릭해 실행합니다.
+`CARGO_TARGET_DIR`을 지정한 경우 해당 폴더 아래에 생성됩니다. 한국어는 앱의 언어 메뉴에서
+선택합니다. 이 스크립트는 설치 파일 생성이나 커밋·푸시는 하지 않습니다.
+기존 craft-fonts는 변경하지 않으므로 오래된 폰트 입력으로 빌드가 실패하면 아래의 고정
+revision을 별도로 준비하고 `CRAFT_FONTS_DIR`로 지정하세요.
+
+### 수동 개발 빌드
+
 Windows PowerShell에서 저장소 루트 기준:
 
 ```powershell
