@@ -6,7 +6,10 @@ Chinese (`zh-hant`, Taiwan), Japanese (`ja`), Brazilian Portuguese (`pt-br`), Sp
 are in [`localization-zh-hans.md`](localization-zh-hans.md), [`localization-zh-hant.md`](localization-zh-hant.md),
 [`localization-ja.md`](localization-ja.md), [`localization-pt-br.md`](localization-pt-br.md), [`localization-es.md`](localization-es.md),
 [`localization-de.md`](localization-de.md), [`localization-ru.md`](localization-ru.md),
-[`localization-cs.md`](localization-cs.md), [`localization-fi.md`](localization-fi.md), [`localization-ka.md`](localization-ka.md), [`localization-id.md`](localization-id.md) and [`localization-vi.md`](localization-vi.md).
+[`localization-cs.md`](localization-cs.md), [`localization-fi.md`](localization-fi.md), [`localization-ka.md`](localization-ka.md), [`localization-id.md`](localization-id.md), [`localization-vi.md`](localization-vi.md) and [`localization-ko.md`](localization-ko.md).
+
+Korean (`ko`) is also available in this personal integration, with Nanum Gothic from the pinned
+craft-fonts input. The translation and font PRs have not merged upstream; see the Korean notes above.
 
 ## Adding a language
 
@@ -27,6 +30,7 @@ are in [`localization-zh-hans.md`](localization-zh-hans.md), [`localization-zh-h
        ZhHans, "zh-hans", "简体中文", "Hans", include_str!("../locales/zh-hans.json");
        ZhHant, "zh-hant", "繁體中文（台灣）", "Hant", include_str!("../locales/zh-hant.json");
        Ja, "ja", "日本語", "Jpan", include_str!("../locales/ja.json");
+       Ko, "ko", "한국어", "Kore", include_str!("../locales/ko.json");
        PtBr, "pt-br", "Português (Brasil)", "Latn", include_str!("../locales/pt-br.json");
        De, "de", "Deutsch", "Latn", include_str!("../locales/de.json");
        Ru, "ru", "Русский", "Cyrl", include_str!("../locales/ru.json");
@@ -116,3 +120,6 @@ bullet, without the `- ` or `### `) is looked up like any message, so a catalog 
 line by line (German does). A line that is re-wrapped or edited no longer matches its translation and
 shows in English until the catalog is updated; untranslated lines are reported by
 `display_label_gaps_are_reported`, never failed.
+
+Korean instead uses `docs/whats-new.ko.md` as a translated document. Keep its dates and sections
+aligned with the English source; the Korean language regression test checks that structure.

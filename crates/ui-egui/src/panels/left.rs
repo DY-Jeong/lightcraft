@@ -924,7 +924,11 @@ fn local_rows(app: &mut LightcraftApp, ui: &mut egui::Ui, now: &LocalNow) {
     // each comes back on its own, or all at once (issue #2114: the row used to bring every one back)
     let hidden = now.hidden.len();
     if hidden > 0 {
-        let label = crate::i18n::tr_format!("Show {hidden} hidden location{}", if hidden == 1 { "" } else { "s" }, hidden = hidden);
+        let label = crate::i18n::tr_format!(
+            "Show {hidden} hidden location{}",
+            crate::i18n::english_ending(if hidden == 1 { "" } else { "s" }),
+            hidden = hidden
+        );
         let resp = row(app, ui, "local:restoreHidden", Icon::Folder, &label, None, false, 0.0)
             .on_hover_text(crate::i18n::tr("Put the locations you removed from Local back (no files change)"));
         if let [(_, only)] = now.hidden.as_slice() {
@@ -1621,12 +1625,13 @@ fn drop_target(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Response
             Ok(r) => {
                 let n = r.get("added").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 let skipped = r.get("skipped").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                let mut msg = crate::i18n::tr_format!("Added {n} photo{} to “{}”", if n == 1 { "" } else { "s" }, a.name, n = n);
+                let mut msg =
+                    crate::i18n::tr_format!("Added {n} photo{} to “{}”", crate::i18n::english_ending(if n == 1 { "" } else { "s" }), a.name, n = n);
                 if skipped > 0 {
                     msg.push_str(" · ");
                     msg.push_str(&crate::i18n::tr_format!(
                         "{n} Local photo{} skipped: albums hold library photos (Add to My Photos first)",
-                        if skipped == 1 { "" } else { "s" },
+                        crate::i18n::english_ending(if skipped == 1 { "" } else { "s" }),
                         n = skipped
                     ));
                 }
@@ -1931,7 +1936,9 @@ fn folder_drop_target(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::R
     let hint = match (&refused, all_here) {
         (Some(_), _) => crate::i18n::tr("Can't be moved here").to_string(),
         (None, true) => crate::i18n::tr_format!("Already in “{}”", name),
-        (None, false) => crate::i18n::tr_format!("Move {n} photo{} to “{}”", if count == 1 { "" } else { "s" }, name, n = count),
+        (None, false) => {
+            crate::i18n::tr_format!("Move {n} photo{} to “{}”", crate::i18n::english_ending(if count == 1 { "" } else { "s" }), name, n = count)
+        }
     };
     super::grid::drag_hint(ui.ctx(), hint);
     if let Some(why) = refused {
@@ -2012,7 +2019,12 @@ pub(crate) fn moved_text(n: u64, name: &str) -> String {
     if n == 0 {
         crate::i18n::tr_format!("Already in “{}”", name)
     } else {
-        crate::i18n::tr_format!("Moved {n} photo{} to “{}”. Edit → Undo moves them back.", if n == 1 { "" } else { "s" }, name, n = n)
+        crate::i18n::tr_format!(
+            "Moved {n} photo{} to “{}”. Edit → Undo moves them back.",
+            crate::i18n::english_ending(if n == 1 { "" } else { "s" }),
+            name,
+            n = n
+        )
     }
 }
 

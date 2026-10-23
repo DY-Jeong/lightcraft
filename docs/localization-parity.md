@@ -1,6 +1,6 @@
 # Localization parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-20 · **Change:** minor (German form of address: *du*; Indonesian and Finnish interface catalogs added; Italian: every interface string translated, native-speaker corrections; Vietnamese shipped; previously minor: de, es, fr, ja, uk catalogs filled; re-measured; Italian and Georgian interface catalogs added) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-23 · **Change:** minor (personal Korean integration: translated interface and release notes, Nanum Gothic; overall readiness not re-scored; previously: German form of address, Indonesian, Finnish, Italian and Vietnamese catalogs) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
 
 How far each interface language is from `full`. How to add or maintain a language is in
 [localization.md](localization.md); per-language notes are in `localization-<code>.md`
@@ -59,7 +59,7 @@ string follows that.
 | 8 | Indonesian | `id` | 2,555 / 2,555 (100%; 2026-10-19: every plain and formats message any catalog has, plus 69 command labels; What's New left in English) | as zh-hans | Latin (Inter covers it) | no (written with an agent; native-speaker pass pending) | partial (target: not shipped) | 2–4 h (native review, lower-layer errors) |
 | 9 | Japanese | `ja` | 2,383 / 2,398 (99%; 2026-10-12) | as zh-hans; vertical export watermarks | Jpan via craft-fonts (BIZ UDPGothic / UDMincho); IME through winit | no (community edits) | partial | 2–4 h (native review, lower-layer errors) |
 | 10 | German | `de` | 3,644 / 3,754 (97%; 2026-10-16: every interface message and every What's New line except 59: the distinct What's New lines whose English text has a ▸ menu path have no German entry yet and wait for #2016; the rest are words spelled the same) | as zh-hans; What's New translated line by line | Latin | no (community edits) | partial | 2–4 h (native review, lower-layer errors) |
-| 11 | Korean | `ko` | 0 (0%) | none | **no Korean (Hangul) face**: needs a non-Adobe OFL face in craft-fonts (Noto CJK is allowed only for Chinese) | no | none | 14–22 h |
+| 11 | Korean | `ko` | 2,624 / 3,790 (69%; 2026-10-23 catalog union; release notes translated separately) | menus, panels, dialogs, dates, counts, release notes; missing messages and lower-layer errors English | Kore via Nanum Gothic Regular/Bold from pinned craft-fonts PR; modern Hangul, existing CJK fallback for Han; no new Jamo shaping or IME claim | contributor review in source PR; no formal review recorded | partial (personal integration; PRs not merged upstream) | not re-estimated |
 | 12 | Vietnamese | `vi` | 2,471 / 2,471 (100% key coverage of current union; intentional English like `ISO`/`OK` kept) | menus, panels, dialogs, presets, profiles, dates, formats; lower-layer errors English | Latin with stacked diacritics (Inter) | no (community contribution) | partial (catalog complete; lower-layer errors English) | 1–3 h |
 
 ## Other languages LightCraft ships (4)
@@ -73,7 +73,8 @@ string follows that.
 | Georgian | `ka` | 2,398 / 2,398 (100%: every plain and formats message any catalog has on 2026-10-12, plus the 27 display labels and 397 What's New lines no other catalog translates) | Geor: no craft-fonts face yet (boxes until one is available) | yes (native speaker) | partial (lower-layer errors English) | 2–4 h (+ a Georgian face) |
 | Finnish | `fi` | 2,610 / 3,308 (79%, measured 2026-10-17: 2,313 plain + 297 formats; the rest is What's New) | Latin (Inter) | yes (written with an agent; native-speaker review by @roopeg) | partial (lower-layer errors English) | 3–5 h |
 
-Target languages LightCraft lacks: Korean, Dutch, Polish, Swedish, Norwegian Bokmål, Thai
+Korean integration and build instructions: [localization-ko.md](localization-ko.md).
+Target languages LightCraft lacks in this branch: Dutch, Polish, Swedish, Norwegian Bokmål, Thai
 (Thai needs shaping and line breaking without spaces). Each Latin-script one is ~10–16 h; Thai
 ~20–35 h on top of the shaping work.
 
@@ -98,6 +99,7 @@ Target languages LightCraft lacks: Korean, Dutch, Polish, Swedish, Norwegian Bok
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | Personal Korean integration from lightcraft PR 2435 and craft-fonts PR 35: 2,340 plain + 299 formats entries, 2,624 non-English values; release notes maintained separately; NanumGothic with verified family metadata; overall readiness not re-scored |
 | 2026-10-19 | minor | Indonesian interface catalog (`id`): every plain and formats message any catalog has, plus 69 command labels; What's New left in English |
 | 2026-10-17 | minor | Finnish interface catalog (`fi`): 2,610 of 3,308 messages (2,313 plain + 297 formats), What's New left in English |
 | 2026-10-15 | trivial | Italian (`it`): 339 interface messages and 60 format strings that were missing or still in English translated (2,628 of 3,278; only What's New left in English); native-speaker corrections: Exposure → *Esposizione*, Sharpening → *Nitidezza*, Preset → *Preset*, blurry → *sfocate* |

@@ -248,8 +248,12 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
                     let ok = files.iter().filter(|f| f.get("path").is_some()).count();
                     let failed: Vec<&Value> = files.iter().filter(|f| f.get("error").is_some()).collect();
                     let skipped = files.iter().filter(|f| f.get("skipped").is_some()).count();
-                    let mut m =
-                        crate::i18n::tr_format!("Exported {ok} of {total} photo{}", if total == 1 { "" } else { "s" }, ok = ok, total = total);
+                    let mut m = crate::i18n::tr_format!(
+                        "Exported {ok} of {total} photo{}",
+                        crate::i18n::english_ending(if total == 1 { "" } else { "s" }),
+                        ok = ok,
+                        total = total
+                    );
                     if let Some(sheet) = sheet {
                         m = format!("Exported contact sheet: {} photos, {} pages", sheet["photos"], sheet["pages"]);
                     }

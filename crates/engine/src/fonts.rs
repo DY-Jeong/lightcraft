@@ -93,6 +93,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nanum_gothic_covers_modern_hangul() {
+        use ab_glyph::Font;
+        let faces: Vec<_> = CRAFT_FONTS.iter().filter(|font| font.family == "NanumGothic" && font.covers("Kore")).collect();
+        if faces.is_empty() {
+            lightcraft_testkit::skip!(Fonts, "built without the Nanum Gothic Korean face");
+            return;
+        }
+        for face in faces {
+            let font = ab_glyph::FontRef::try_from_slice(face.bytes).expect("Nanum Gothic parses");
+            for ch in '\u{ac00}'..='\u{d7a3}' {
+                assert_ne!(font.glyph_id(ch).0, 0, "{} {} lacks {ch}", face.family, face.style);
+            }
+        }
+        let first = |style| ui_fallback(CRAFT_FONTS, "Kore", style).first().map(|face| (face.family, face.style));
+        assert_eq!(first("Regular"), Some(("NanumGothic", "Regular")));
+        if CRAFT_FONTS.iter().any(|face| face.family == "NanumGothic" && face.style == "Bold") {
+            assert_eq!(first("Bold"), Some(("NanumGothic", "Bold")));
+        }
+    }
+
+    #[test]
     fn craft_fonts_are_well_formed_or_absent() {
         if CRAFT_FONTS.is_empty() {
             eprintln!("built without CRAFT_FONTS_DIR: no craft-fonts to check");

@@ -310,7 +310,7 @@ fn drop_target(app: &mut LightcraftApp, ui: &mut egui::Ui, rect: Rect, path: &st
                     ui.ctx(),
                     crate::i18n::tr_format!(
                         "Added “{keyword}” to {n} photo{}",
-                        if n == 1 { "" } else { "s" },
+                        crate::i18n::english_ending(if n == 1 { "" } else { "s" }),
                         keyword = path.replace('|', " › "),
                         n = n
                     ),
@@ -621,13 +621,13 @@ mod tests {
             "Export Keywords…",
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
-        for code in ["de", "es", "fr", "pt-br", "ru", "uk", "it", "ka", "ja", "zh-hans", "zh-hant", "pl", "cs", "sv", "fi", "id", "vi"] {
+        for code in ["de", "es", "fr", "pt-br", "ru", "uk", "it", "ka", "ja", "zh-hans", "zh-hant", "pl", "cs", "sv", "fi", "id", "vi", "ko"] {
             let text = std::fs::read_to_string(dir.join(format!("{code}.json"))).unwrap();
             let catalog: std::collections::HashMap<String, String> = serde_json::from_str(&text).unwrap();
             for label in labels {
                 assert!(catalog.contains_key(label), "{code}: “{label}”");
             }
         }
-        assert_eq!(Locale::ALL.len(), 18, "a language added: list its file above");
+        assert_eq!(Locale::ALL.len(), 19, "a language added: list its file above");
     }
 }

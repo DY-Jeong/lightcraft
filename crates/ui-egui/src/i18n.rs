@@ -120,6 +120,7 @@ language_table! {
     ZhHans, "zh-hans", "简体中文", "Hans", include_str!("../locales/zh-hans.json");
     ZhHant, "zh-hant", "繁體中文（台灣）", "Hant", include_str!("../locales/zh-hant.json");
     Ja, "ja", "日本語", "Jpan", include_str!("../locales/ja.json");
+    Ko, "ko", "한국어", "Kore", include_str!("../locales/ko.json");
     PtBr, "pt-br", "Português (Brasil)", "Latn", include_str!("../locales/pt-br.json");
     Es, "es", "Español", "Latn", include_str!("../locales/es.json");
     De, "de", "Deutsch", "Latn", include_str!("../locales/de.json");
@@ -221,6 +222,16 @@ pub fn set_language(language: Locale) {
 
 pub fn language() -> Locale {
     LOCALE.with(std::cell::Cell::get)
+}
+
+/// English-only grammatical endings passed to translated format strings.
+/// Apply only to audited suffix/agreement arguments, never to user data or counts.
+pub(crate) fn english_ending(ending: &str) -> &str {
+    english_ending_for(language().code(), ending)
+}
+
+fn english_ending_for<'a>(code: &str, ending: &'a str) -> &'a str {
+    if code == "ko" { "" } else { ending }
 }
 
 /// Translate a built-in display label, preserving unknown labels verbatim.
@@ -935,6 +946,7 @@ mod tests {
             ("app.language.english", Locale::En),
             ("app.language.simplifiedChinese", Locale::ZhHans),
             ("app.language.japanese", Locale::Ja),
+            ("app.language.korean", Locale::Ko),
             ("app.language.portuguese", Locale::PtBr),
             ("app.language.french", Locale::Fr),
             ("app.language.spanish", Locale::Es),
@@ -1462,7 +1474,7 @@ mod tests {
         for language in Locale::ALL.iter().filter(|language| **language != Locale::En) {
             let catalog = language.catalog();
             let missing: Vec<&&str> = labels[..ui_labels].iter().filter(|label| !catalog.contains_key(**label)).collect();
-            let notes = labels[ui_labels..].iter().filter(|label| !catalog.contains_key(**label)).count();
+            let notes = if *language == Locale::Ko { 0 } else { labels[ui_labels..].iter().filter(|label| !catalog.contains_key(**label)).count() };
             if !missing.is_empty() || notes > 0 {
                 eprintln!(
                     "{} lacks {} display label(s) (shown in English): {missing:?}; and {notes} What's New line(s)",
@@ -1711,7 +1723,8 @@ mod tests {
     /// family, Monospace included.
     #[test]
     fn craft_fonts_render_cjk_in_the_ui() {
-        let samples = [(Locale::Ja, "日本語の文字"), (Locale::ZhHans, "简体中文字"), (Locale::ZhHant, "繁體中文字")];
+        let samples =
+            [(Locale::Ja, "日本語の文字"), (Locale::ZhHans, "简体中文字"), (Locale::ZhHant, "繁體中文字"), (Locale::Ko, "한국어한글사진漢字")];
         for (language, sample) in samples {
             if !lightcraft_engine::CRAFT_FONTS.iter().any(|font| font.serves(language.script())) {
                 lightcraft_testkit::skip!(Fonts, "{}: built without a craft-fonts face for {}", language.code(), language.script());
@@ -1813,6 +1826,76 @@ mod tests {
         app.run("app.language.english", serde_json::json!({})).unwrap();
         assert_eq!(tr("File"), "File");
         assert_eq!(chinese_ids, ids(&app));
+    }
+
+    #[test]
+    fn korean_release_notes_and_formats_are_paintable() {
+        if !lightcraft_engine::CRAFT_FONTS.iter().any(|font| font.serves("Kore")) {
+            lightcraft_testkit::skip!(Fonts, "built without a craft-fonts face for Korean");
+            return;
+        }
+        set_language(Locale::Ko);
+        let formats: BTreeMap<String, String> = serde_json::from_str(include_str!("../locales/ko-formats.json")).unwrap();
+        let characters: std::collections::BTreeSet<char> = formats
+            .values()
+            .flat_map(|message| message.chars())
+            .chain(crate::panels::dialogs::whats_new().chars())
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let ctx = fonts_ctx(lightcraft_engine::CRAFT_FONTS);
+        ctx.fonts_mut(|fonts| {
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Name(crate::theme::FONT_SEMIBOLD.into())] {
+                let font = egui::FontId::new(13.0, family);
+                for ch in &characters {
+                    assert!(fonts.has_glyph(&font, *ch), "{font:?} lacks Korean notes/format glyph {ch:?}");
+                }
+            }
+        });
+        set_language(Locale::En);
+    }
+
+    /// Korean uses the menu/control path, preserves data, and drops only audited English endings.
+    #[test]
+    fn korean_switches_through_menu_and_control_and_persists() {
+        use crate::control::{ControlRequest, Outcome};
+        let mut app = crate::LightcraftApp::new(lightcraft_engine::Session::with_demo(), Default::default());
+        app.run("app.language.korean", serde_json::json!({})).unwrap();
+        assert_eq!(app.ui.language, Locale::Ko);
+        let notes = app.run("app.whatsNew", serde_json::json!({})).unwrap();
+        assert_eq!(notes["text"], include_str!("../../../docs/whats-new.ko.md"));
+        let headings = |text: &str| text.lines().filter(|line| line.starts_with("##")).count();
+        assert_eq!(headings(crate::panels::dialogs::whats_new()), headings(crate::panels::dialogs::WHATS_NEW));
+        let dates = |text: &str| text.lines().filter(|line| line.starts_with("## ")).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(dates(crate::panels::dialogs::whats_new()), dates(crate::panels::dialogs::WHATS_NEW));
+        assert_eq!(tr("File"), "파일");
+        assert_eq!(source_label(lightcraft_engine::LibrarySource::All, &app.session.catalog), "모든 사진");
+        assert_eq!(date_group_label("2026-09-20", false), "2026년 9월 20일 일요일");
+        assert_eq!(date_group_label("2026-09", false), "2026년 9월");
+        assert_eq!(date_group_label("2026-09", true), "9월");
+        assert_eq!(tr("Family Trip.jpg"), "Family Trip.jpg");
+        for n in [0, 1, 2, 12] {
+            let ending = english_ending(if n == 1 { "" } else { "s" });
+            let expected = "사진 {n}장{}".replace("{n}", &n.to_string()).replace("{}", "");
+            assert_eq!(tr_format!("{n} photo{}", ending, n = n), expected);
+        }
+        assert_eq!(
+            tr_format!("Unknown tag{s} {} stay{} as typed (see Tags)", "sample.xmp", english_ending("s"), s = english_ending("s")),
+            "알 수 없는 태그 sample.xmp은(는) 입력한 그대로 유지됩니다(태그 참조)"
+        );
+        let saved = serde_json::to_string(&app.ui).unwrap();
+        assert_eq!(serde_json::from_str::<crate::state::UiState>(&saved).unwrap().language, Locale::Ko);
+        assert_eq!(crate::menubar::checked(&app, "app.language.korean"), Some(true));
+        let ctx = egui::Context::default();
+        for code in ["ko", "ko-KR", "ko_KR.UTF-8"] {
+            let (req, _) = ControlRequest::new("ui.set", serde_json::json!({"language": code}));
+            let Outcome::Done(reply) = crate::control::handle(&mut app, &ctx, &req) else { panic!("expected a reply") };
+            assert_eq!(reply["ok"], true, "{code}");
+            assert_eq!(app.ui.language, Locale::Ko);
+        }
+        app.run("app.language.english", serde_json::json!({})).unwrap();
+        assert_eq!(english_ending("s"), "s");
+        assert_eq!(tr_format!("{n} photo{}", english_ending("s"), n = 2), "2 photos");
+        set_language(Locale::En);
     }
 
     /// Dates follow every language's own patterns; English keeps the catalog's wording.
@@ -2068,5 +2151,22 @@ mod picker_order_tests {
         let menu: Vec<&str> = crate::menus::LANGUAGE_COMMANDS.iter().map(|c| c.1).collect();
         let picker: Vec<&str> = Locale::for_picker().into_iter().map(Locale::name).collect();
         assert_eq!(menu, picker, "Edit ▸ Language and the Settings row list the languages the same way");
+    }
+}
+
+#[cfg(test)]
+mod korean_grammar_tests {
+    use super::english_ending_for;
+
+    #[test]
+    fn korean_omits_only_explicit_english_grammar_arguments() {
+        for ending in ["", "s", "es", "it is", "they are", "it", "them"] {
+            assert_eq!(english_ending_for("ko", ending), "");
+            for code in ["en", "ja", "zh", "fr", "de", "cs", "uk"] {
+                assert_eq!(english_ending_for(code, ending), ending);
+            }
+        }
+        let name = "Trips {s}";
+        assert_eq!(format!("{name}{}", english_ending_for("ko", "s")), name);
     }
 }
