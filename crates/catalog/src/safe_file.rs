@@ -269,20 +269,34 @@ fn same_content(path: &Path, data: &[u8]) -> io::Result<bool> {
 
 /// Do `a` and `b` name the same existing file (through links, `..`, case-insensitive names)?
 pub fn same_file(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::MetadataExt;
-        ma.dev() == mb.dev() && ma.ino() == mb.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        if ma.len() != mb.len() {
-            return false;
+        match same_file::is_same_file(a, b) {
+            Ok(same) => same,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                log::warn!("could not compare file identity for {} and {}: {e}", a.display(), b.display());
+                false
+            }
         }
-        match (fs::canonicalize(a), fs::canonicalize(b)) {
-            (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
-            _ => false,
+    }
+    #[cfg(not(windows))]
+    {
+        let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ma.dev() == mb.dev() && ma.ino() == mb.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            if ma.len() != mb.len() {
+                return false;
+            }
+            match (fs::canonicalize(a), fs::canonicalize(b)) {
+                (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
+                _ => false,
+            }
         }
     }
 }
@@ -407,6 +421,22 @@ mod tests {
         assert!(same_file(&p, &d.join("sub/../x.jpg")));
         assert!(!same_file(&p, &d.join("y.jpg")));
         assert!(!same_file(&p, &d.join("missing.jpg")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn same_file_sees_hard_links_without_equating_identical_contents() {
+        let d = temp("hard-link-identity");
+        let original = d.join("original.jpg");
+        let alias = d.join("linked.png");
+        let other = d.join("other.jpg");
+        fs::write(&original, b"original").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        fs::write(&other, b"original").unwrap();
+        assert!(same_file(&original, &alias));
+        assert!(same_file(&alias, &original));
+        assert!(!same_file(&original, &other), "identical contents are not file identity");
         let _ = fs::remove_dir_all(&d);
     }
 }

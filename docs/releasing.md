@@ -61,18 +61,16 @@ shipped language needs: a stale pin still builds, it just ships tofu (issue #319
 from before Noto Sans CJK SC, so Simplified Chinese had no glyphs). Before a release, check the pin against
 craft-fonts' `fonts/manifest.txt` and run `CRAFT_FONTS_DIR=../craft-fonts cargo test -p lightcraft-ui-egui i18n`,
 whose glyph-coverage test checks the characters in available faces. `CRAFT_FONTS_REQUIRED=1` now also makes
-the native build fail if the pinned manifest lacks Noto Sans CJK SC Regular (`Hans`), BIZ UDPGothic Regular
-or NanumGothic Regular (`Kore`); the web build includes NanumGothic Regular and BIZ UDPGothic Regular
-and packages Noto Sans CJK SC as a separate asset. This personal Korean integration pins the unmerged
-font revision documented in [localization-ko.md](localization-ko.md).
+the native build fail if the pinned manifest lacks Noto Sans CJK SC Regular (`Hans`) or BIZ UDPGothic Regular;
+the web build requires BIZ UDPGothic Regular and packages Noto Sans CJK SC as a separate asset.
 
 Local macOS, Linux and Windows packaging scripts automatically use the sibling `../craft-fonts`
 checkout. If it is absent, they clone it at revision
-`7ef0ffc2291b3e7dc8dcfaa78ed8e51b0453f5b0` (keep the pins in `packaging/fonts.sh` and
+`b076417b5880bd4154bd22f00695b1d28c6bea83` (keep the pins in `packaging/fonts.sh` and
 `packaging/windows/fonts.ps1` in sync with the release workflow). Existing checkouts are left untouched.
 Set `CRAFT_FONTS_DIR` to use another
 checkout; relative paths resolve from the workspace root. The script requires the Chinese and Japanese
-UI faces plus NanumGothic and includes their OFL licences in the package. Download failures or incomplete checkouts
+UI faces and includes their OFL licences in the package. Download failures or incomplete checkouts
 stop packaging with an error. `--skip-build` (`-SkipBuild` on Windows) packages existing binaries without downloading fonts or
 changing what they embed; pass the same `CRAFT_FONTS_DIR` used to compile them so their licences ship.
 

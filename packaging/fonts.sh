@@ -8,19 +8,18 @@ prepare_fonts() {
     *) font_dir="$ROOT/$font_dir" ;;
   esac
 
-  if [ -z "${CRAFT_FONTS_DIR:-}" ] && [ ! -e "$font_dir" ]; then
+  if [[ -z "${CRAFT_FONTS_DIR:-}" ]] && [[ ! -e "$font_dir" ]]; then
     # Same revision as release.yml. Never update or reset an existing checkout.
-    local revision=7ef0ffc2291b3e7dc8dcfaa78ed8e51b0453f5b0
+    local revision=b076417b5880bd4154bd22f00695b1d28c6bea83
     echo "==> downloading craft-fonts ($revision) to $font_dir"
     if ! git clone --no-checkout https://github.com/storytold/craft-fonts "$font_dir" ||
-       ! git -C "$font_dir" fetch --depth 1 origin "$revision" ||
        ! git -C "$font_dir" checkout --detach "$revision"; then
       echo "error: could not prepare craft-fonts; provide a complete checkout with CRAFT_FONTS_DIR" >&2
       return 1
     fi
   fi
 
-  if [ ! -f "$font_dir/fonts/manifest.txt" ]; then
+  if [[ ! -f "$font_dir/fonts/manifest.txt" ]]; then
     echo "error: missing $font_dir/fonts/manifest.txt; set CRAFT_FONTS_DIR to a complete craft-fonts checkout" >&2
     return 1
   fi
